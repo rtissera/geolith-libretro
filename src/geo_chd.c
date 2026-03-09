@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2022-2025 Rupert Carmichael
+Copyright (c) 2026 Romain Tisserand
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without

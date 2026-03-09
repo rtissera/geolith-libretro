@@ -33,10 +33,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>
 
 #include "geo.h"
 #include "geo_cd.h"
-#include "geo_chd.h"
+#include "geo_disc.h"
 #include "geo_lspc.h"
 #include "geo_m68k.h"
 #include "geo_mixer.h"
@@ -66,6 +67,7 @@ static void *romdata = NULL;
 // CD mode flag and system type
 static int cd_mode = 0;
 static int cd_systype = SYSTEM_CDZ;
+static int cd_bios_unibios = 0;
 static int cd_speed_hack = 1;
 static int cd_skip_loading = 1;
 
@@ -634,10 +636,16 @@ static void check_variables(bool first_run) {
         var.value = NULL;
 
         if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-            if (!strcmp(var.value, "cd"))
+            if (!strcmp(var.value, "cd")) {
                 cd_systype = SYSTEM_CD;
-            else if (!strcmp(var.value, "cdz"))
+                cd_bios_unibios = 0;
+            } else if (!strcmp(var.value, "cdz")) {
                 cd_systype = SYSTEM_CDZ;
+                cd_bios_unibios = 0;
+            } else if (!strcmp(var.value, "cdz_unibios")) {
+                cd_systype = SYSTEM_CDZ;
+                cd_bios_unibios = 1;
+            }
         }
 
         // CD Speed Hack
@@ -967,7 +975,7 @@ void retro_get_system_info(struct retro_system_info *info) {
     info->library_name     = "Geolith";
     info->library_version  = "0.3.0";
     info->need_fullpath    = true; // Required for CHD support
-    info->valid_extensions = "neo|chd";
+    info->valid_extensions = "neo|chd|cue";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info) {
@@ -992,9 +1000,50 @@ void retro_get_system_av_info(struct retro_system_av_info *info) {
     };
 }
 
+static void update_option_visibility(void) {
+    struct retro_core_option_display opt_display;
+
+    // Cart-only options: hide in CD mode
+    const char *cart_opts[] = {
+        "geolith_system_type", "geolith_unibios_hw",
+        "geolith_memcard", "geolith_memcard_wp",
+        "geolith_settingmode", "geolith_4player", "geolith_freeplay",
+        NULL
+    };
+
+    // CD-only options: hide in cart mode
+    const char *cd_opts[] = {
+        "geolith_cd_system_type", "geolith_cd_speed_hack",
+        "geolith_cd_skip_loading",
+        NULL
+    };
+
+    for (int i = 0; cart_opts[i]; ++i) {
+        opt_display.key = cart_opts[i];
+        opt_display.visible = !cd_mode;
+        environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &opt_display);
+    }
+
+    for (int i = 0; cd_opts[i]; ++i) {
+        opt_display.key = cd_opts[i];
+        opt_display.visible = cd_mode;
+        environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &opt_display);
+    }
+}
+
+static bool RETRO_CALLCONV core_options_update_display(void) {
+    update_option_visibility();
+    return true;
+}
+
 void retro_set_environment(retro_environment_t cb) {
     environ_cb = cb;
     libretro_set_core_options(environ_cb);
+
+    struct retro_core_options_update_display_callback display_cb;
+    display_cb.callback = core_options_update_display;
+    environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK,
+        &display_cb);
 }
 
 void retro_set_audio_sample(retro_audio_sample_t cb) {
@@ -1065,17 +1114,25 @@ bool retro_load_game(const struct retro_game_info *info) {
     cd_mode = 0;
     if (info->path) {
         const char *ext = strrchr(info->path, '.');
-        if (ext && (!strcmp(ext, ".chd") || !strcmp(ext, ".CHD"))) {
+        if (ext && (!strcasecmp(ext, ".chd") || !strcasecmp(ext, ".cue"))) {
             cd_mode = 1;
             systype = cd_systype;
             geo_set_system(systype);
         }
     }
 
+    update_option_visibility();
+
     char biospath[256];
     if (cd_mode) {
-        snprintf(biospath, sizeof(biospath), "%s%c%s", sysdir, pss,
-            systype == SYSTEM_CDZ ? "neocdz.zip" : "neocd.zip");
+        const char *biosname;
+        if (cd_bios_unibios)
+            biosname = "uni-bioscd.zip";
+        else if (systype == SYSTEM_CDZ)
+            biosname = "neocdz.zip";
+        else
+            biosname = "neocd.zip";
+        snprintf(biospath, sizeof(biospath), "%s%c%s", sysdir, pss, biosname);
     } else {
         snprintf(biospath, sizeof(biospath), "%s%c%s", sysdir, pss,
             systype ? "neogeo.zip" : "aes.zip");
@@ -1123,9 +1180,9 @@ bool retro_load_game(const struct retro_game_info *info) {
     }
 
     if (cd_mode) {
-        // CD mode: open CHD file and byteswap BIOS
-        if (!geo_chd_open(info->path)) {
-            log_cb(RETRO_LOG_ERROR, "Failed to open CHD: %s\n", info->path);
+        // CD mode: open disc image and byteswap BIOS
+        if (!geo_disc_open(info->path)) {
+            log_cb(RETRO_LOG_ERROR, "Failed to open disc: %s\n", info->path);
             retro_unload_game();
             return false;
         }
@@ -1239,7 +1296,7 @@ bool retro_load_game(const struct retro_game_info *info) {
     }
 
     if (cd_mode) {
-        // CD subsystem must be initialized after BIOS is loaded and CHD is
+        // CD subsystem must be initialized after BIOS is loaded and disc is
         // opened, but before the first reset. retro_init()/geo_init() runs
         // before we know the content type, so CD init is deferred to here.
         geo_set_system(systype);
@@ -1247,16 +1304,63 @@ bool retro_load_game(const struct retro_game_info *info) {
         geo_cd_init();
         geo_m68k_set_memmap_cd();
         geo_z80_set_cd_mode();
+
+        // Load CD backup RAM from disk
+        char savename[292];
+        snprintf(savename, sizeof(savename), "%s%c%s.srm",
+            savedir, pss, gamename);
+
+        RFILE *sf = filestream_open(savename,
+            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+        if (sf) {
+            void *bram = (void*)geo_cd_backup_ram_ptr();
+            filestream_read(sf, bram, SIZE_8K);
+            filestream_close(sf);
+            log_cb(RETRO_LOG_DEBUG, "Loaded CD backup RAM: %s\n", savename);
+        }
     }
 
     geo_reset(1);
+
+    // Expose memory maps for RetroArch cheats/achievements
+    if (cd_mode) {
+        static struct retro_memory_descriptor cd_descs[] = {
+            // Program RAM: 0x000000-0x1FFFFF (2MB)
+            { RETRO_MEMDESC_SYSTEM_RAM, NULL, 0, 0x000000, 0, 0, SIZE_2M, "PRAM" },
+            // Backup RAM: 0x800000-0x801FFF (8K, odd bytes only)
+            { RETRO_MEMDESC_SAVE_RAM,   NULL, 0, 0x800000, 0, 0, SIZE_8K, "BRAM" },
+        };
+        cd_descs[0].ptr = (void*)geo_cd_pram_ptr();
+        cd_descs[1].ptr = (void*)geo_cd_backup_ram_ptr();
+
+        struct retro_memory_map cd_mmap = {
+            cd_descs, sizeof(cd_descs) / sizeof(cd_descs[0])
+        };
+        environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &cd_mmap);
+    }
+
     return true;
 }
 
 void retro_unload_game(void) {
     if (cd_mode) {
-        // CD mode: close CHD and cleanup CD subsystem
-        geo_chd_close();
+        // Save CD backup RAM to disk
+        char savename[292];
+        snprintf(savename, sizeof(savename), "%s%c%s.srm",
+            savedir, pss, gamename);
+
+        const void *bram = geo_cd_backup_ram_ptr();
+        RFILE *sf = filestream_open(savename,
+            RETRO_VFS_FILE_ACCESS_WRITE,
+            RETRO_VFS_FILE_ACCESS_HINT_NONE);
+        if (sf) {
+            filestream_write(sf, bram, SIZE_8K);
+            filestream_close(sf);
+            log_cb(RETRO_LOG_DEBUG, "Saved CD backup RAM: %s\n", savename);
+        }
+
+        // CD mode: close disc and cleanup CD subsystem
+        geo_disc_close();
         geo_cd_deinit();
     }
     else {

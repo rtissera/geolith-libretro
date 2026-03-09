@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2022-2025 Rupert Carmichael
+Copyright (c) 2026 Romain Tisserand
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -74,8 +74,9 @@ void geo_cd_state_load(uint8_t *st);
 void geo_cd_state_save(uint8_t *st);
 size_t geo_cd_state_size(void);
 
-// Backup RAM access for save data
+// RAM access for save data and memory maps
 const void* geo_cd_backup_ram_ptr(void);
+const void* geo_cd_pram_ptr(void);
 
 // BIOS family detection
 #define CD_BIOS_UNKNOWN     0

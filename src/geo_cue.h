@@ -28,38 +28,19 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#ifndef GEO_CHD_H
-#define GEO_CHD_H
+#ifndef GEO_CUE_H
+#define GEO_CUE_H
 
-#define GEO_CHD_MAX_TRACKS  99
-#define GEO_CHD_SECTOR_SIZE 2352
-#define GEO_CHD_DATA_SIZE   2048
+int geo_cue_open(const char *path);
+void geo_cue_close(void);
 
-#define GEO_CHD_TRACK_DATA  0
-#define GEO_CHD_TRACK_AUDIO 1
+int geo_cue_read_sector(uint32_t disc_lba, uint8_t *buf);
+int geo_cue_read_audio(uint32_t disc_lba, int16_t *buf);
 
-typedef struct _geo_chd_track_t {
-    uint32_t start;     // CD position (what BIOS sees) - index 1 start
-    uint32_t chd_start; // CHD position (for data reading)
-    uint32_t frames;    // Number of frames in track (index 1 length)
-    uint32_t pregap;    // Pregap frames
-    uint8_t type;       // GEO_CHD_TRACK_DATA or GEO_CHD_TRACK_AUDIO
-} geo_chd_track_t;
-
-int geo_chd_open(const char *path);
-void geo_chd_close(void);
-
-int geo_chd_read_sector(uint32_t disc_lba, uint8_t *buf);
-int geo_chd_read_audio(uint32_t disc_lba, int16_t *buf);
-
-unsigned geo_chd_num_tracks(void);
-const geo_chd_track_t* geo_chd_get_track(unsigned track);
-int geo_chd_track_is_audio(unsigned track);
-uint32_t geo_chd_track_start(unsigned track);
-uint32_t geo_chd_track_frames(unsigned track);
-uint32_t geo_chd_leadout(void);
-
-uint32_t geo_chd_msf_to_lba(uint8_t m, uint8_t s, uint8_t f);
-void geo_chd_lba_to_msf(uint32_t lba, uint8_t *m, uint8_t *s, uint8_t *f);
+unsigned geo_cue_num_tracks(void);
+int geo_cue_track_is_audio(unsigned track);
+uint32_t geo_cue_track_start(unsigned track);
+uint32_t geo_cue_track_frames(unsigned track);
+uint32_t geo_cue_leadout(void);
 
 #endif
