@@ -99,6 +99,7 @@ static void geo_mixer_resamp(size_t in_ym) {
         (spx_int16_t*)ybuf, &insamps, (spx_int16_t*)abuf, &outsamps);
 
     geo_mixer_mix_cdda(outsamps);
+    geo_cd_cdda_clear();
 
     geo_mixer_cb(outsamps << 1);
 }
