@@ -35,10 +35,13 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <string.h>
 
 #include "geo.h"
+#include "geo_cd.h"
+#include "geo_chd.h"
 #include "geo_lspc.h"
 #include "geo_m68k.h"
 #include "geo_mixer.h"
 #include "geo_neo.h"
+#include "geo_z80.h"
 
 #include "libretro.h"
 #include "libretro_core_options.h"
@@ -59,6 +62,10 @@ static size_t numsamps = 0;
 
 // Copy of the ROM data passed in by the frontend
 static void *romdata = NULL;
+
+// CD mode flag and system type
+static int cd_mode = 0;
+static int cd_systype = SYSTEM_CDZ;
 
 // Game name without path or extension
 static char gamename[128];
@@ -620,6 +627,17 @@ static void check_variables(bool first_run) {
                 systype = SYSTEM_UNI;
         }
 
+        // CD System Type
+        var.key   = "geolith_cd_system_type";
+        var.value = NULL;
+
+        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+            if (!strcmp(var.value, "cd"))
+                cd_systype = SYSTEM_CD;
+            else if (!strcmp(var.value, "cdz"))
+                cd_systype = SYSTEM_CDZ;
+        }
+
         // Universe BIOS Hardware
         var.key   = "geolith_unibios_hw";
         var.value = NULL;
@@ -930,8 +948,8 @@ void retro_get_system_info(struct retro_system_info *info) {
     memset(info, 0, sizeof(*info));
     info->library_name     = "Geolith";
     info->library_version  = "0.3.0";
-    info->need_fullpath    = false;
-    info->valid_extensions = "neo";
+    info->need_fullpath    = true; // Required for CHD support
+    info->valid_extensions = "neo|chd";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info) {
@@ -1013,23 +1031,43 @@ bool retro_load_game(const struct retro_game_info *info) {
     if (!environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &sysdir) || !sysdir)
         return false;
 
+    // Detect CD mode from file extension
+    cd_mode = 0;
+    if (info->path) {
+        const char *ext = strrchr(info->path, '.');
+        if (ext && (!strcmp(ext, ".chd") || !strcmp(ext, ".CHD"))) {
+            cd_mode = 1;
+            systype = cd_systype;
+            geo_set_system(systype);
+        }
+    }
+
     char biospath[256];
-    snprintf(biospath, sizeof(biospath), "%s%c%s", sysdir, pss,
-        systype ? "neogeo.zip" : "aes.zip");
+    if (cd_mode) {
+        snprintf(biospath, sizeof(biospath), "%s%c%s", sysdir, pss,
+            systype == SYSTEM_CDZ ? "neocdz.zip" : "neocd.zip");
+    } else {
+        snprintf(biospath, sizeof(biospath), "%s%c%s", sysdir, pss,
+            systype ? "neogeo.zip" : "aes.zip");
+    }
 
     if (vfs) {
         RFILE* barchive = filestream_open(biospath,
             RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
 
-        if (!barchive)
+        if (!barchive) {
+            log_cb(RETRO_LOG_ERROR, "Failed to open bios at: %s\n", biospath);
             return false;
+        }
 
         filestream_seek(barchive, 0, RETRO_VFS_SEEK_POSITION_END);
         int64_t barchivesize = filestream_tell(barchive);
 
         void* barchivebuf = (void*)calloc(1, barchivesize);
-        if (!barchivebuf)
+        if (!barchivebuf) {
+            filestream_close(barchive);
             return false;
+        }
 
         filestream_seek(barchive, 0, RETRO_VFS_SEEK_POSITION_START);
         if (filestream_read(barchive, barchivebuf, barchivesize) < 0) {
@@ -1042,6 +1080,7 @@ bool retro_load_game(const struct retro_game_info *info) {
 
         if (!geo_bios_load_mem(barchivebuf, barchivesize)) {
             log_cb(RETRO_LOG_ERROR, "Failed to load bios at: %s\n", biospath);
+            free(barchivebuf);
             return false;
         }
 
@@ -1053,18 +1092,68 @@ bool retro_load_game(const struct retro_game_info *info) {
         return false;
     }
 
-    /* Keep an internal copy of the ROM to avoid relying on the frontend
-       keeping it persistently, and to avoid altering memory controlled by
-       the frontend (portions are byteswapped or otherwise manipulated inside
-       the emulator at load time)
-    */
-    romdata = (void*)calloc(1, info->size);
-    memcpy(romdata, info->data, info->size);
+    if (cd_mode) {
+        // CD mode: open CHD file and byteswap BIOS
+        if (!geo_chd_open(info->path)) {
+            log_cb(RETRO_LOG_ERROR, "Failed to open CHD: %s\n", info->path);
+            retro_unload_game();
+            return false;
+        }
 
-    if (!geo_neo_load(romdata, info->size)) {
-        log_cb(RETRO_LOG_ERROR, "Failed to load ROM\n");
-        retro_unload_game();
-        return false;
+        // Byteswap the BIOS (same as cartridge postload does)
+        romdata_t *rd = geo_romdata_ptr();
+        uint16_t *bios16 = (uint16_t*)rd->b;
+        for (size_t i = 0; i < rd->bsz >> 1; ++i)
+            bios16[i] = (bios16[i] << 8) | (bios16[i] >> 8);
+    }
+    else {
+        // Cartridge mode: load NEO file
+        /* Keep an internal copy of the ROM to avoid relying on the frontend
+           keeping it persistently, and to avoid altering memory controlled by
+           the frontend (portions are byteswapped or otherwise manipulated
+           inside the emulator at load time)
+        */
+        if (info->data && info->size) {
+            romdata = (void*)calloc(1, info->size);
+            if (romdata) {
+                memcpy(romdata, info->data, info->size);
+            }
+        } else if (info->path) {
+            // need_fullpath is true, so load from path
+            FILE *f = fopen(info->path, "rb");
+            if (!f) {
+                log_cb(RETRO_LOG_ERROR, "Failed to open ROM: %s\n", info->path);
+                retro_unload_game();
+                return false;
+            }
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            romdata = (void*)calloc(1, sz);
+            if (!romdata) {
+                fclose(f);
+                retro_unload_game();
+                return false;
+            }
+            if (fread(romdata, 1, sz, f) != (size_t)sz) {
+                free(romdata);
+                romdata = NULL;
+                fclose(f);
+                log_cb(RETRO_LOG_ERROR, "Failed to read ROM: %s\n", info->path);
+                retro_unload_game();
+                return false;
+            }
+            fclose(f);
+
+            if (!geo_neo_load(romdata, sz)) {
+                log_cb(RETRO_LOG_ERROR, "Failed to load ROM\n");
+                retro_unload_game();
+                return false;
+            }
+        } else {
+            log_cb(RETRO_LOG_ERROR, "No ROM data provided\n");
+            return false;
+        }
     }
 
     // Extract the game name from the path
@@ -1074,21 +1163,24 @@ bool retro_load_game(const struct retro_game_info *info) {
     if (!environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &savedir) || !savedir)
         return false;
 
-    // Load any existing saved data
-    char savename[292];
-    char *fext[] = { "nv", "srm", "mcr" };
+    if (!cd_mode) {
+        // Load any existing saved data (cartridge mode)
+        char savename[292];
+        char *fext[] = { "nv", "srm", "mcr" };
 
-    for (unsigned i = 0; i < GEO_SAVEDATA_MAX; ++i) {
-        snprintf(savename, sizeof(savename), "%s%c%s.%s",
-            savedir, pss, gamename, fext[i]);
+        for (unsigned i = 0; i < GEO_SAVEDATA_MAX; ++i) {
+            snprintf(savename, sizeof(savename), "%s%c%s.%s",
+                savedir, pss, gamename, fext[i]);
 
-        int savestat = vfs ? geo_savedata_load_vfs(i, (const char*)savename) :
-            geo_savedata_load(i, (const char*)savename);
+            int savestat = vfs ?
+                geo_savedata_load_vfs(i, (const char*)savename) :
+                geo_savedata_load(i, (const char*)savename);
 
-        if (savestat == 1)
-            log_cb(RETRO_LOG_DEBUG, "Loaded: %s\n", savename);
-        else if (savestat != 2)
-            log_cb(RETRO_LOG_DEBUG, "Load Failed: %s\n", savename);
+            if (savestat == 1)
+                log_cb(RETRO_LOG_DEBUG, "Loaded: %s\n", savename);
+            else if (savestat != 2)
+                log_cb(RETRO_LOG_DEBUG, "Load Failed: %s\n", savename);
+        }
     }
 
     geo_input_set_callback(0, &geo_input_poll_js);
@@ -1098,13 +1190,13 @@ bool retro_load_game(const struct retro_game_info *info) {
     geo_input_sys_set_callback(2, &geo_input_poll_systype);
     geo_input_sys_set_callback(3, &geo_input_poll_dipsw);
 
-    if (fourplayer) {
+    if (!cd_mode && fourplayer) {
         geo_input_set_callback(0, &geo_input_poll_js_ftc1b);
         geo_input_set_callback(1, &geo_input_poll_js_ftc1b);
         geo_input_sys_set_callback(1, &geo_input_poll_stat_b_ftc1b);
     }
 
-    if (geo_neo_flags() & GEO_DB_VLINER) {
+    if (!cd_mode && geo_neo_flags() & GEO_DB_VLINER) {
         geo_input_set_callback(0, &geo_input_poll_vliner);
         geo_input_set_callback(1, &geo_input_poll_none);
         geo_input_sys_set_callback(0, &geo_input_poll_stat_a_vliner);
@@ -1116,26 +1208,44 @@ bool retro_load_game(const struct retro_game_info *info) {
         environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, input_desc_js);
     }
 
+    if (cd_mode) {
+        // CD subsystem must be initialized after BIOS is loaded and CHD is
+        // opened, but before the first reset. retro_init()/geo_init() runs
+        // before we know the content type, so CD init is deferred to here.
+        geo_set_system(systype);
+        geo_cd_init();
+        geo_m68k_set_memmap_cd();
+        geo_z80_set_cd_mode();
+    }
+
     geo_reset(1);
     return true;
 }
 
 void retro_unload_game(void) {
-    // Save NVRAM, Cartridge RAM, and Memory Card
-    char savename[292];
-    char *fext[] = { "nv", "srm", "mcr" };
+    if (cd_mode) {
+        // CD mode: close CHD and cleanup CD subsystem
+        geo_chd_close();
+        geo_cd_deinit();
+    }
+    else {
+        // Cartridge mode: save NVRAM, Cartridge RAM, and Memory Card
+        char savename[292];
+        char *fext[] = { "nv", "srm", "mcr" };
 
-    for (unsigned i = 0; i < GEO_SAVEDATA_MAX; ++i) {
-        snprintf(savename, sizeof(savename), "%s%c%s.%s",
-            savedir, pss, gamename, fext[i]);
+        for (unsigned i = 0; i < GEO_SAVEDATA_MAX; ++i) {
+            snprintf(savename, sizeof(savename), "%s%c%s.%s",
+                savedir, pss, gamename, fext[i]);
 
-        int savestat = vfs ? geo_savedata_save_vfs(i, (const char*)savename) :
-            geo_savedata_save(i, (const char*)savename);
+            int savestat = vfs ?
+                geo_savedata_save_vfs(i, (const char*)savename) :
+                geo_savedata_save(i, (const char*)savename);
 
-        if (savestat == 1)
-            log_cb(RETRO_LOG_DEBUG, "Saved: %s\n", savename);
-        else if (savestat != 2)
-            log_cb(RETRO_LOG_DEBUG, "Save Failed: %s\n", savename);
+            if (savestat == 1)
+                log_cb(RETRO_LOG_DEBUG, "Saved: %s\n", savename);
+            else if (savestat != 2)
+                log_cb(RETRO_LOG_DEBUG, "Save Failed: %s\n", savename);
+        }
     }
 
     if (romdata)

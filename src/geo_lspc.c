@@ -30,14 +30,17 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "geo.h"
+#include "geo_cd.h"
 #include "geo_m68k.h"
 #include "geo_lspc.h"
 #include "geo_serial.h"
 
 #define M68K_CYC_PER_LINE 768
 
+static void geo_lspc_fixline_default(void);
 static void (*geo_lspc_fixline)(void);
 
 static lspc_t lspc;
@@ -485,6 +488,10 @@ void geo_lspc_init(void) {
     geo_lspc_shadow_wr(0);
 
     romdata = geo_romdata_ptr();
+
+    // Default fix line renderer and fix data pointer
+    geo_lspc_fixline = &geo_lspc_fixline_default;
+    fixdata = romdata->s ? romdata->s : romdata->sfix;
 }
 
 // No Fix Layer Banking (Default)
@@ -948,8 +955,11 @@ void geo_lspc_run(unsigned cycs) {
         if ((start <= 29) && (end > 29)) {
             if (lspc.scanline == LSPC_LINE_BORDER_TOP)
                 geo_lspc_aa();
-            else if (lspc.scanline == LSPC_LINE_BORDER_BOTTOM + 1)
-                geo_m68k_interrupt(IRQ_VBLANK);
+            else if (lspc.scanline == LSPC_LINE_BORDER_BOTTOM + 1) {
+                // In CD mode, VBL is masked by irqMask2 bits 4+5
+                if (geo_get_system() < 0x03 || geo_cd_vbl_enabled())
+                    geo_m68k_interrupt(irq_vbl_level);
+            }
         }
 
         if ((start <= 573) && (end > 573)) {
