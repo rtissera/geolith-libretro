@@ -84,6 +84,28 @@ struct retro_core_option_definition option_defs_us[] = {
       "cdz"
    },
    {
+      "geolith_cd_speed_hack",
+      "CD Speed Hack (CD Only)",
+      "Patch BIOS busy-wait loops to reduce loading times",
+      {
+         { "enabled", "Enabled" },
+         { "disabled", "Disabled" },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+   {
+      "geolith_cd_skip_loading",
+      "Skip CD Loading (CD Only)",
+      "Fast-forward through CD loading screens",
+      {
+         { "enabled", "Enabled" },
+         { "disabled", "Disabled" },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+   {
       "geolith_region",
       "Region (Restart)",
       "Specify the Region: USA, Japan, Asia, Europe",

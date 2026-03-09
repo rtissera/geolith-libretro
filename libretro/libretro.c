@@ -66,6 +66,8 @@ static void *romdata = NULL;
 // CD mode flag and system type
 static int cd_mode = 0;
 static int cd_systype = SYSTEM_CDZ;
+static int cd_speed_hack = 1;
+static int cd_skip_loading = 1;
 
 // Game name without path or extension
 static char gamename[128];
@@ -638,6 +640,22 @@ static void check_variables(bool first_run) {
                 cd_systype = SYSTEM_CDZ;
         }
 
+        // CD Speed Hack
+        var.key   = "geolith_cd_speed_hack";
+        var.value = NULL;
+
+        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+            cd_speed_hack = !strcmp(var.value, "enabled");
+        }
+
+        // CD Skip Loading
+        var.key   = "geolith_cd_skip_loading";
+        var.value = NULL;
+
+        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+            cd_skip_loading = !strcmp(var.value, "enabled");
+        }
+
         // Universe BIOS Hardware
         var.key   = "geolith_unibios_hw";
         var.value = NULL;
@@ -1006,6 +1024,18 @@ void retro_reset(void) {
 void retro_run(void) {
     geo_exec();
 
+    // CD loading skip: fast-forward through loading screens
+    if (cd_mode && cd_skip_loading && geo_cd_sector_decoded_this_frame()) {
+        // Keep running frames while CD sectors are being decoded (max 300 frames)
+        int skip_frames = 0;
+        while (geo_cd_sector_decoded_this_frame() && skip_frames < 300) {
+            geo_cd_clear_sector_decoded();
+            geo_exec();
+            ++skip_frames;
+        }
+    }
+    geo_cd_clear_sector_decoded();
+
     bool update = false;
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &update) && update) {
         check_variables(false);
@@ -1213,6 +1243,7 @@ bool retro_load_game(const struct retro_game_info *info) {
         // opened, but before the first reset. retro_init()/geo_init() runs
         // before we know the content type, so CD init is deferred to here.
         geo_set_system(systype);
+        geo_cd_set_speed_hack(cd_speed_hack);
         geo_cd_init();
         geo_m68k_set_memmap_cd();
         geo_z80_set_cd_mode();
@@ -1282,6 +1313,11 @@ bool retro_unserialize(const void *data, size_t size) {
 
 void *retro_get_memory_data(unsigned id) {
     switch (id) {
+        case RETRO_MEMORY_SAVE_RAM: {
+            if (cd_mode)
+                return (void*)geo_cd_backup_ram_ptr();
+            return NULL;
+        }
         case RETRO_MEMORY_SYSTEM_RAM: {
             return (void*)geo_mem_ptr(GEO_MEMTYPE_MAINRAM, NULL);
         }
@@ -1298,6 +1334,11 @@ size_t retro_get_memory_size(unsigned id) {
     void *mem = NULL;
     size_t sz = 0;
     switch (id) {
+        case RETRO_MEMORY_SAVE_RAM: {
+            if (cd_mode)
+                return SIZE_8K;
+            return 0;
+        }
         case RETRO_MEMORY_SYSTEM_RAM: {
             mem = (void*)geo_mem_ptr(GEO_MEMTYPE_MAINRAM, &sz);
             break;
