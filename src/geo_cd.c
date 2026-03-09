@@ -1758,6 +1758,16 @@ void geo_cd_cdda_clear(void) {
     cdda_samples = 0;
 }
 
+void geo_cd_cdda_consume(size_t consumed) {
+    if (consumed >= cdda_samples) {
+        cdda_samples = 0;
+        return;
+    }
+    size_t remaining = cdda_samples - consumed;
+    memmove(cdda_buf, cdda_buf + consumed * 2, remaining * 2 * sizeof(int16_t));
+    cdda_samples = remaining;
+}
+
 // =========================================================================
 // Init/Reset/Deinit
 // =========================================================================
