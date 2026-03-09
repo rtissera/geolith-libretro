@@ -327,6 +327,10 @@ void geo_lspc_set_palette(unsigned p) {
         geo_lspc_palconv(i, lspc.palram[i]);
 }
 
+void geo_lspc_set_cd_mode(int enabled) {
+    lspc.cd_mode = enabled ? 1 : 0;
+}
+
 // Perform post-load operations for C ROM
 void geo_lspc_postload(void) {
     crommask = geo_calc_mask(32, romdata->csz >> 7);
@@ -713,10 +717,21 @@ static inline unsigned geo_lspc_tpix(unsigned tbase, unsigned x, unsigned y) {
               reverse order from how it is displayed unless horizontal flip
               is enabled for the tile.
     */
-    unsigned v0 = (romdata->c[(tbase + 0) + (y << 2)]) >> (x);
-    unsigned v1 = (romdata->c[(tbase + 2) + (y << 2)]) >> (x);
-    unsigned v2 = (romdata->c[(tbase + 1) + (y << 2)]) >> (x);
-    unsigned v3 = (romdata->c[(tbase + 3) + (y << 2)]) >> (x);
+    unsigned base = tbase + (y << 2);
+    unsigned v0, v1, v2, v3;
+    if (lspc.cd_mode) {
+        // CD SPR DRAM: non-interleaved byte order [1, 0, 3, 2]
+        v0 = (romdata->c[base + 1]) >> (x);
+        v1 = (romdata->c[base + 0]) >> (x);
+        v2 = (romdata->c[base + 3]) >> (x);
+        v3 = (romdata->c[base + 2]) >> (x);
+    } else {
+        // Cart C ROM: interleaved odd/even byte order [0, 2, 1, 3]
+        v0 = (romdata->c[base + 0]) >> (x);
+        v1 = (romdata->c[base + 2]) >> (x);
+        v2 = (romdata->c[base + 1]) >> (x);
+        v3 = (romdata->c[base + 3]) >> (x);
+    }
     return (v0 & 0x01) | (v1 & 0x01) << 1 | (v2 & 0x01) << 2 | (v3 & 0x01) << 3;
 }
 
