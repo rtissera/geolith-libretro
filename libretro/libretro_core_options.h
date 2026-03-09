@@ -73,6 +73,17 @@ struct retro_core_option_definition option_defs_us[] = {
       "mvs"
    },
    {
+      "geolith_cd_system_type",
+      "CD System Type (Restart, CD Only)",
+      "Specify the CD System Type when loading Neo Geo CD disc images",
+      {
+         { "cdz", "Neo Geo CDZ" },
+         { "cd", "Neo Geo CD" },
+         { NULL, NULL },
+      },
+      "cdz"
+   },
+   {
       "geolith_region",
       "Region (Restart)",
       "Specify the Region: USA, Japan, Asia, Europe",
