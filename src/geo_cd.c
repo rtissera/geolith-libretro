@@ -802,12 +802,23 @@ static void cd_comm_process_command(void) {
 // =========================================================================
 // DMA Implementation
 // =========================================================================
-static void cd_dma_resolve_dest(uint32_t address, uint8_t **dst_ptr, uint32_t *dst_mask) {
+// Destination types for DMA
+#define DMA_DEST_RAM     0
+#define DMA_DEST_MAPPED  1
+#define DMA_DEST_PALETTE 2
+
+static int cd_dma_resolve_dest(uint32_t address, uint8_t **dst_ptr, uint32_t *dst_mask) {
     address &= 0xffffff;
     if (address < 0x200000) {
         // Program RAM
         *dst_ptr = pram;
         *dst_mask = SIZE_2M - 1;
+        return DMA_DEST_RAM;
+    } else if (address >= 0x400000 && address < 0x800000) {
+        // Palette RAM — handled via geo_lspc_palram_wr16 for color conversion
+        *dst_ptr = (uint8_t*)1; // non-NULL sentinel
+        *dst_mask = 0x1fff; // 8K palette entries (16KB / 2)
+        return DMA_DEST_PALETTE;
     } else if (address >= 0xe00000 && address <= 0xefffff) {
         // Mapped area — route based on transfer_area register
         switch (transfer_area) {
@@ -829,37 +840,46 @@ static void cd_dma_resolve_dest(uint32_t address, uint8_t **dst_ptr, uint32_t *d
                 break;
             default:
                 *dst_ptr = NULL;
-                break;
+                return DMA_DEST_RAM;
         }
+        return DMA_DEST_MAPPED;
     } else {
         *dst_ptr = NULL;
+        return DMA_DEST_RAM;
     }
 }
 
 // Write a 16-bit word to the DMA destination, advancing offset by 2.
 // Handles mapped area address transformations for FIX/Z80/PCM (addr >> 1, low byte).
 static void dma_write_word(uint8_t *ptr, uint32_t mask, uint32_t *offset,
-                           uint16_t data, int mapped) {
-    if (mapped) {
-        switch (transfer_area) {
-            case 0: { // SPR - big-endian word write
-                uint32_t addr = *offset & (mask & ~1u);
-                ptr[addr] = (data >> 8) & 0xff;
-                ptr[addr + 1] = data & 0xff;
-                break;
+                           uint16_t data, int dest_type) {
+    switch (dest_type) {
+        case DMA_DEST_MAPPED:
+            switch (transfer_area) {
+                case 0: { // SPR - big-endian word write
+                    uint32_t addr = *offset & (mask & ~1u);
+                    ptr[addr] = (data >> 8) & 0xff;
+                    ptr[addr + 1] = data & 0xff;
+                    break;
+                }
+                case 1: // PCM - address >> 1, low byte
+                case 4: // Z80 - address >> 1, low byte
+                case 5: { // FIX - address >> 1, low byte
+                    uint32_t addr = (*offset >> 1) & mask;
+                    ptr[addr] = data & 0xff;
+                    break;
+                }
             }
-            case 1: // PCM - address >> 1, low byte
-            case 4: // Z80 - address >> 1, low byte
-            case 5: { // FIX - address >> 1, low byte
-                uint32_t addr = (*offset >> 1) & mask;
-                ptr[addr] = data & 0xff;
-                break;
-            }
-        }
-    } else {
-        // Program RAM - big-endian word write
-        ptr[*offset & mask] = (data >> 8) & 0xff;
-        ptr[(*offset + 1) & mask] = data & 0xff;
+            break;
+        case DMA_DEST_PALETTE:
+            // Route through LSPC palette write for proper color conversion
+            geo_lspc_palram_wr16(*offset, data);
+            break;
+        default:
+            // Program RAM - big-endian word write
+            ptr[*offset & mask] = (data >> 8) & 0xff;
+            ptr[(*offset + 1) & mask] = data & 0xff;
+            break;
     }
     *offset += 2;
 }
@@ -871,15 +891,12 @@ static void cd_dma_execute(void) {
     uint8_t *dst_ptr = NULL;
     uint32_t dst_mask = 0;
 
-    cd_dma_resolve_dest(dma.dst, &dst_ptr, &dst_mask);
+    int dest_type = cd_dma_resolve_dest(dma.dst, &dst_ptr, &dst_mask);
     if (!dst_ptr) {
         geo_log(GEO_LOG_WRN, "DMA to unknown address: %06x area=%u\n", dma.dst, transfer_area);
         dma.enabled = 0;
         return;
     }
-
-    // Determine if destination is mapped area (needs address transformation)
-    int is_mapped = (dma.dst >= 0xe00000 && dma.dst <= 0xefffff);
 
     switch (dma.config) {
         case 0xffc5:
@@ -892,7 +909,7 @@ static void cd_dma_execute(void) {
             if (len > 0x400) len = 0x400;
             for (uint32_t i = 0; i < len; ++i) {
                 uint16_t data = (source[i] >> 8) | (source[i] << 8); // big-endian
-                dma_write_word(dst_ptr, dst_mask, &dst, data, is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, data, dest_type);
             }
             lc8951_end_transfer();
             break;
@@ -907,8 +924,8 @@ static void cd_dma_execute(void) {
             if (len > 0x400) len = 0x400;
             for (uint32_t i = 0; i < len; ++i) {
                 uint16_t data = (source[i] >> 8) | (source[i] << 8); // big-endian
-                dma_write_word(dst_ptr, dst_mask, &dst, data >> 8, is_mapped);
-                dma_write_word(dst_ptr, dst_mask, &dst, data, is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, data >> 8, dest_type);
+                dma_write_word(dst_ptr, dst_mask, &dst, data, dest_type);
             }
             lc8951_end_transfer();
             break;
@@ -920,16 +937,15 @@ static void cd_dma_execute(void) {
             uint32_t src = dma.dst;   // Hardware "destination" register is actually source
             uint32_t dst = dma.src;   // Hardware "source" register is actually destination
             // Re-resolve destination from the actual destination address
-            cd_dma_resolve_dest(dst, &dst_ptr, &dst_mask);
+            dest_type = cd_dma_resolve_dest(dst, &dst_ptr, &dst_mask);
             if (!dst_ptr) {
                 geo_log(GEO_LOG_WRN, "DMA fe3d to unknown address: %06x\n", dst);
                 break;
             }
-            is_mapped = (dst >= 0xe00000 && dst <= 0xefffff);
 
             for (uint32_t i = 0; i < dma.len; ++i) {
                 uint16_t w = read16(pram, src & (SIZE_2M - 1));
-                dma_write_word(dst_ptr, dst_mask, &dst, w, is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, w, dest_type);
                 src += 2;
             }
             break;
@@ -940,8 +956,8 @@ static void cd_dma_execute(void) {
             uint32_t address = dma.dst;
             uint32_t dst = dma.dst;
             for (uint32_t i = 0; i < dma.len; ++i) {
-                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 16), is_mapped);
-                dma_write_word(dst_ptr, dst_mask, &dst, address, is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 16), dest_type);
+                dma_write_word(dst_ptr, dst_mask, &dst, address, dest_type);
                 address += 4;
             }
             break;
@@ -952,7 +968,7 @@ static void cd_dma_execute(void) {
             // Writes pattern word per iteration via mapped handler
             uint32_t dst = dma.dst;
             for (uint32_t i = 0; i < dma.len; ++i) {
-                dma_write_word(dst_ptr, dst_mask, &dst, dma.val, is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, dma.val, dest_type);
             }
             break;
         }
@@ -964,18 +980,17 @@ static void cd_dma_execute(void) {
             uint32_t dst = dma.src;   // Hardware "source" is actually destination
 
             // Re-resolve destination from the actual destination address
-            cd_dma_resolve_dest(dst, &dst_ptr, &dst_mask);
+            dest_type = cd_dma_resolve_dest(dst, &dst_ptr, &dst_mask);
             if (!dst_ptr) {
                 geo_log(GEO_LOG_WRN, "DMA e2dd to unknown address: %06x\n", dst);
                 break;
             }
-            is_mapped = (dst >= 0xe00000 && dst <= 0xefffff);
 
             for (uint32_t i = 0; i < dma.len; ++i) {
                 uint16_t data = read16(pram, src & (SIZE_2M - 1));
                 uint16_t swapped = (data >> 8) | (data << 8);
-                dma_write_word(dst_ptr, dst_mask, &dst, swapped, is_mapped);
-                dma_write_word(dst_ptr, dst_mask, &dst, data, is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, swapped, dest_type);
+                dma_write_word(dst_ptr, dst_mask, &dst, data, dest_type);
                 src += 2;
             }
             break;
@@ -986,10 +1001,10 @@ static void cd_dma_execute(void) {
             uint32_t address = dma.dst;
             uint32_t dst = dma.dst;
             for (uint32_t i = 0; i < dma.len; ++i) {
-                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 24), is_mapped);
-                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 16), is_mapped);
-                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 8), is_mapped);
-                dma_write_word(dst_ptr, dst_mask, &dst, address, is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 24), dest_type);
+                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 16), dest_type);
+                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 8), dest_type);
+                dma_write_word(dst_ptr, dst_mask, &dst, address, dest_type);
                 address += 8;
             }
             break;
@@ -1757,6 +1772,7 @@ void geo_cd_init(void) {
     memset(&dma, 0, sizeof(dma));
 
     // Redirect ROM data pointers to CD RAM for LSPC and YM2610
+    geo_lspc_set_cd_mode(1);
     romdata->c = spr_dram;
     romdata->csz = SIZE_4M;
     romdata->s = fix_ram;
