@@ -304,7 +304,7 @@ static inline uint8_t from_bcd(uint8_t val) {
 static void lc8951_reset(void) {
     memset(&lc, 0, sizeof(lc));
     lc.ifstat = 0xff; // All interrupt flags cleared (active low)
-    // Initialize WAL/WAH to 0x0930 (2352 = one raw sector size)
+    // WAL/WAH initialized to 0x0930 (2352 = one raw sector size)
     lc.wal = 0x0930;
 }
 
@@ -836,6 +836,34 @@ static void cd_dma_resolve_dest(uint32_t address, uint8_t **dst_ptr, uint32_t *d
     }
 }
 
+// Write a 16-bit word to the DMA destination, advancing offset by 2.
+// Handles mapped area address transformations for FIX/Z80/PCM (addr >> 1, low byte).
+static void dma_write_word(uint8_t *ptr, uint32_t mask, uint32_t *offset,
+                           uint16_t data, int mapped) {
+    if (mapped) {
+        switch (transfer_area) {
+            case 0: { // SPR - big-endian word write
+                uint32_t addr = *offset & (mask & ~1u);
+                ptr[addr] = (data >> 8) & 0xff;
+                ptr[addr + 1] = data & 0xff;
+                break;
+            }
+            case 1: // PCM - address >> 1, low byte
+            case 4: // Z80 - address >> 1, low byte
+            case 5: { // FIX - address >> 1, low byte
+                uint32_t addr = (*offset >> 1) & mask;
+                ptr[addr] = data & 0xff;
+                break;
+            }
+        }
+    } else {
+        // Program RAM - big-endian word write
+        ptr[*offset & mask] = (data >> 8) & 0xff;
+        ptr[(*offset + 1) & mask] = data & 0xff;
+    }
+    *offset += 2;
+}
+
 static void cd_dma_execute(void) {
     if (!dma.enabled || dma.len == 0)
         return;
@@ -857,55 +885,30 @@ static void cd_dma_execute(void) {
         case 0xffc5:
         case 0xff89: {
             // Copy from LC8951 buffer to destination
-            uint32_t src = 0;
+            // Reads big-endian words from LC8951 buffer, writes via mapped handler
+            uint16_t *source = (uint16_t*)lc.buffer;
             uint32_t dst = dma.dst;
             uint32_t len = dma.len;
             if (len > 0x400) len = 0x400;
-            if (is_mapped && transfer_area == 5) {
-                // FIX: address >> 1, write low byte only
-                for (uint32_t i = 0; i < len; ++i) {
-                    uint32_t fix_addr = (dst >> 1) & dst_mask;
-                    dst_ptr[fix_addr] = lc.buffer[src + 1];
-                    src += 2;
-                    dst += 2;
-                }
-            } else if (is_mapped && (transfer_area == 4)) {
-                // Z80: address >> 1, write low byte only
-                for (uint32_t i = 0; i < len; ++i) {
-                    uint32_t z_addr = (dst >> 1) & dst_mask;
-                    dst_ptr[z_addr] = lc.buffer[src + 1];
-                    src += 2;
-                    dst += 2;
-                }
-            } else {
-                // Program RAM or SPR/PCM: direct word copy
-                for (uint32_t i = 0; i < len; ++i) {
-                    dst_ptr[dst & dst_mask] = lc.buffer[src];
-                    dst_ptr[(dst + 1) & dst_mask] = lc.buffer[src + 1];
-                    src += 2;
-                    dst += 2;
-                }
+            for (uint32_t i = 0; i < len; ++i) {
+                uint16_t data = (source[i] >> 8) | (source[i] << 8); // big-endian
+                dma_write_word(dst_ptr, dst_mask, &dst, data, is_mapped);
             }
             lc8951_end_transfer();
             break;
         }
         case 0xfc2d: {
-            // Copy from LC8951 buffer, odd bytes only
-            uint32_t src = 0;
+            // Copy from LC8951 buffer, odd bytes
+            // Reads word from LC8951 buffer, writes 2 words per iteration
+            // (high byte as word, low byte as word) through mapped handler
+            uint16_t *source = (uint16_t*)lc.buffer;
             uint32_t dst = dma.dst;
-            if (is_mapped && (transfer_area == 5 || transfer_area == 4)) {
-                for (uint32_t i = 0; i < dma.len; ++i) {
-                    uint32_t addr = (dst >> 1) & dst_mask;
-                    dst_ptr[addr] = lc.buffer[src + 1];
-                    src += 2;
-                    dst += 2;
-                }
-            } else {
-                for (uint32_t i = 0; i < dma.len; ++i) {
-                    dst_ptr[dst & dst_mask] = lc.buffer[src + 1];
-                    src += 2;
-                    dst += 1;
-                }
+            uint32_t len = dma.len;
+            if (len > 0x400) len = 0x400;
+            for (uint32_t i = 0; i < len; ++i) {
+                uint16_t data = (source[i] >> 8) | (source[i] << 8); // big-endian
+                dma_write_word(dst_ptr, dst_mask, &dst, data >> 8, is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, data, is_mapped);
             }
             lc8951_end_transfer();
             break;
@@ -913,6 +916,7 @@ static void cd_dma_execute(void) {
         case 0xfe3d:
         case 0xfe6d: {
             // RAM to RAM copy — source and destination registers are REVERSED
+            // Reads word from source, writes word to dest via mapped handler
             uint32_t src = dma.dst;   // Hardware "destination" register is actually source
             uint32_t dst = dma.src;   // Hardware "source" register is actually destination
             // Re-resolve destination from the actual destination address
@@ -923,65 +927,39 @@ static void cd_dma_execute(void) {
             }
             is_mapped = (dst >= 0xe00000 && dst <= 0xefffff);
 
-            if (is_mapped && (transfer_area == 5)) {
-                for (uint32_t i = 0; i < dma.len; ++i) {
-                    uint16_t w = read16(pram, src & (SIZE_2M - 1));
-                    uint32_t fix_addr = (dst >> 1) & dst_mask;
-                    dst_ptr[fix_addr] = w & 0xff;
-                    src += 2;
-                    dst += 2;
-                }
-            } else if (is_mapped && (transfer_area == 4)) {
-                for (uint32_t i = 0; i < dma.len; ++i) {
-                    uint16_t w = read16(pram, src & (SIZE_2M - 1));
-                    uint32_t z_addr = (dst >> 1) & dst_mask;
-                    dst_ptr[z_addr] = w & 0xff;
-                    src += 2;
-                    dst += 2;
-                }
-            } else {
-                for (uint32_t i = 0; i < dma.len; ++i) {
-                    uint16_t w = read16(pram, src & (SIZE_2M - 1));
-                    dst_ptr[dst & dst_mask] = w >> 8;
-                    dst_ptr[(dst + 1) & dst_mask] = w & 0xff;
-                    src += 2;
-                    dst += 2;
-                }
+            for (uint32_t i = 0; i < dma.len; ++i) {
+                uint16_t w = read16(pram, src & (SIZE_2M - 1));
+                dma_write_word(dst_ptr, dst_mask, &dst, w, is_mapped);
+                src += 2;
             }
             break;
         }
         case 0xfef5: {
             // Fill with incrementing addresses
+            // Writes 2 words per iteration (addr>>16, addr), address increments by 4
+            uint32_t address = dma.dst;
             uint32_t dst = dma.dst;
             for (uint32_t i = 0; i < dma.len; ++i) {
-                dst_ptr[dst & dst_mask] = (dst >> 8) & 0xff;
-                dst_ptr[(dst + 1) & dst_mask] = dst & 0xff;
-                dst += 2;
+                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 16), is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, address, is_mapped);
+                address += 4;
             }
             break;
         }
         case 0xffcd:
         case 0xffdd: {
             // Pattern fill
+            // Writes pattern word per iteration via mapped handler
             uint32_t dst = dma.dst;
-            if (is_mapped && (transfer_area == 5)) {
-                for (uint32_t i = 0; i < dma.len; ++i) {
-                    uint32_t fix_addr = (dst >> 1) & dst_mask;
-                    dst_ptr[fix_addr] = dma.val & 0xff;
-                    dst += 2;
-                }
-            } else {
-                for (uint32_t i = 0; i < dma.len; ++i) {
-                    dst_ptr[dst & dst_mask] = dma.val >> 8;
-                    dst_ptr[(dst + 1) & dst_mask] = dma.val & 0xff;
-                    dst += 2;
-                }
+            for (uint32_t i = 0; i < dma.len; ++i) {
+                dma_write_word(dst_ptr, dst_mask, &dst, dma.val, is_mapped);
             }
             break;
         }
         case 0xe2dd:
         case 0xf2dd: {
             // Copy odd bytes — source and destination registers are REVERSED
+            // Reads word, writes BYTE_SWAP_16(data) then data (2 words per iteration)
             uint32_t src = dma.dst;   // Hardware "destination" is actually source
             uint32_t dst = dma.src;   // Hardware "source" is actually destination
 
@@ -993,19 +971,26 @@ static void cd_dma_execute(void) {
             }
             is_mapped = (dst >= 0xe00000 && dst <= 0xefffff);
 
-            if (is_mapped && (transfer_area == 5 || transfer_area == 4)) {
-                for (uint32_t i = 0; i < dma.len; ++i) {
-                    uint32_t addr = (dst >> 1) & dst_mask;
-                    dst_ptr[addr] = pram[(src + 1) & (SIZE_2M - 1)];
-                    src += 2;
-                    dst += 2;
-                }
-            } else {
-                for (uint32_t i = 0; i < dma.len; ++i) {
-                    dst_ptr[dst & dst_mask] = pram[(src + 1) & (SIZE_2M - 1)];
-                    src += 2;
-                    dst += 1;
-                }
+            for (uint32_t i = 0; i < dma.len; ++i) {
+                uint16_t data = read16(pram, src & (SIZE_2M - 1));
+                uint16_t swapped = (data >> 8) | (data << 8);
+                dma_write_word(dst_ptr, dst_mask, &dst, swapped, is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, data, is_mapped);
+                src += 2;
+            }
+            break;
+        }
+        case 0xcffd: {
+            // Fill odd bytes with incrementing addresses
+            // Writes 4 words per iteration (addr bytes high to low), address increments by 8
+            uint32_t address = dma.dst;
+            uint32_t dst = dma.dst;
+            for (uint32_t i = 0; i < dma.len; ++i) {
+                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 24), is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 16), is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, (address >> 8), is_mapped);
+                dma_write_word(dst_ptr, dst_mask, &dst, address, is_mapped);
+                address += 8;
             }
             break;
         }
@@ -1686,7 +1671,7 @@ void geo_cd_tick(unsigned mcycles) {
                     cdda_samples = CDDA_SAMPLES_PER_FRAME;
                 } else {
                     // Past end of disc or read error — output silence
-                    // but keep playing (drive stays in PLAY status)
+                    // but keep playing (BIOS expects drive stays in PLAY status)
                     memset(cdda_buf, 0, sizeof(cdda_buf));
                     cdda_samples = CDDA_SAMPLES_PER_FRAME;
                 }
