@@ -38,7 +38,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "geo.h"
 #include "geo_cd.h"
-#include "geo_chd.h"
+#include "geo_disc.h"
 #include "geo_lspc.h"
 #include "geo_m68k.h"
 #include "geo_serial.h"
@@ -445,7 +445,7 @@ static void lc8951_sector_decoded(void) {
 
     // Update head registers with current position MSF
     uint8_t m, s, f;
-    geo_chd_lba_to_msf(cd.play_lba + 150, &m, &s, &f);
+    geo_disc_lba_to_msf(cd.play_lba + 150, &m, &s, &f);
     lc.head[0] = to_bcd(m);
     lc.head[1] = to_bcd(s);
     lc.head[2] = to_bcd(f);
@@ -457,13 +457,13 @@ static void lc8951_sector_decoded(void) {
 
     // Simplified LC8951: write 2048 bytes of user data at buffer[0]
     // DMA always reads from buffer[0], ignoring DACL register
-    uint8_t sector[GEO_CHD_DATA_SIZE];
-    if (geo_chd_read_sector(cd.play_lba, sector))
-        memcpy(lc.buffer, sector, GEO_CHD_DATA_SIZE);
+    uint8_t sector[GEO_DISC_DATA_SIZE];
+    if (geo_disc_read_sector(cd.play_lba, sector))
+        memcpy(lc.buffer, sector, GEO_DISC_DATA_SIZE);
 
     // Advance write address and pointer by one raw sector (for BIOS register reads)
-    lc.wal += GEO_CHD_SECTOR_SIZE;
-    lc.ptl += GEO_CHD_SECTOR_SIZE;
+    lc.wal += GEO_DISC_SECTOR_SIZE;
+    lc.ptl += GEO_DISC_SECTOR_SIZE;
 
     // Set STAT registers
     lc.stat0 = 0x80; // CRCOK
@@ -567,45 +567,45 @@ static void cd_comm_process_command(void) {
         case 0x20: { // Query TOC/position info
             uint8_t subcmd = cd.cmd[1] & 0x0f;
             if ((cd.drive_status == CD_STATUS_IDLE) &&
-                geo_chd_num_tracks() > 0)
+                geo_disc_num_tracks() > 0)
                 cd.drive_status = CD_STATUS_STOP;
 
             switch (subcmd) {
                 case 0x00: { // Current absolute position
-                    geo_chd_lba_to_msf(cd.play_lba + 150, &m, &s, &f);
+                    geo_disc_lba_to_msf(cd.play_lba + 150, &m, &s, &f);
                     cd.status[0] = cd.drive_status;
                     cd.status[1] = to_bcd(m);
                     cd.status[2] = to_bcd(s);
                     cd.status[3] = to_bcd(f);
                     uint8_t is_data = 0;
-                    for (unsigned i = 0; i < geo_chd_num_tracks(); ++i) {
-                        if (cd.play_lba >= geo_chd_track_start(i + 1))
-                            is_data = !geo_chd_track_is_audio(i + 1);
+                    for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
+                        if (cd.play_lba >= geo_disc_track_start(i + 1))
+                            is_data = !geo_disc_track_is_audio(i + 1);
                     }
                     cd.status[4] = is_data ? 0x40 : 0x00;
                     break;
                 }
                 case 0x01: { // Current relative position
-                    geo_chd_lba_to_msf(cd.play_lba + 150, &m, &s, &f);
+                    geo_disc_lba_to_msf(cd.play_lba + 150, &m, &s, &f);
                     cd.status[0] = cd.drive_status | 0x01;
                     cd.status[1] = to_bcd(m);
                     cd.status[2] = to_bcd(s);
                     cd.status[3] = to_bcd(f);
                     uint8_t is_data = 0;
-                    for (unsigned i = 0; i < geo_chd_num_tracks(); ++i) {
-                        if (cd.play_lba >= geo_chd_track_start(i + 1))
-                            is_data = !geo_chd_track_is_audio(i + 1);
+                    for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
+                        if (cd.play_lba >= geo_disc_track_start(i + 1))
+                            is_data = !geo_disc_track_is_audio(i + 1);
                     }
                     cd.status[4] = is_data ? 0x40 : 0x00;
                     break;
                 }
                 case 0x02: { // Current track
                     uint8_t track = 1;
-                    for (unsigned i = 0; i < geo_chd_num_tracks(); ++i) {
-                        if (cd.play_lba >= geo_chd_track_start(i + 1))
+                    for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
+                        if (cd.play_lba >= geo_disc_track_start(i + 1))
                             track = i + 1;
                     }
-                    uint8_t is_data = !geo_chd_track_is_audio(track);
+                    uint8_t is_data = !geo_disc_track_is_audio(track);
                     cd.status[0] = cd.drive_status | 0x02;
                     cd.status[1] = to_bcd(track);
                     cd.status[2] = to_bcd(1); // index
@@ -614,8 +614,8 @@ static void cd_comm_process_command(void) {
                     break;
                 }
                 case 0x03: { // Leadout address
-                    uint32_t lo = geo_chd_leadout();
-                    geo_chd_lba_to_msf(lo + 150, &m, &s, &f);
+                    uint32_t lo = geo_disc_leadout();
+                    geo_disc_lba_to_msf(lo + 150, &m, &s, &f);
                     cd.status[0] = cd.drive_status | 0x03;
                     cd.status[1] = to_bcd(m);
                     cd.status[2] = to_bcd(s);
@@ -626,16 +626,16 @@ static void cd_comm_process_command(void) {
                 case 0x04: { // First and last track
                     cd.status[0] = cd.drive_status | 0x04;
                     cd.status[1] = to_bcd(1);
-                    cd.status[2] = to_bcd(geo_chd_num_tracks());
+                    cd.status[2] = to_bcd(geo_disc_num_tracks());
                     cd.status[3] = 0;
                     cd.status[4] = 0;
                     break;
                 }
                 case 0x05: { // Track N start time
                     uint8_t track = from_bcd(cd.cmd[2]);
-                    uint32_t start = geo_chd_track_start(track);
-                    geo_chd_lba_to_msf(start + 150, &m, &s, &f);
-                    uint8_t is_data = !geo_chd_track_is_audio(track);
+                    uint32_t start = geo_disc_track_start(track);
+                    geo_disc_lba_to_msf(start + 150, &m, &s, &f);
+                    uint8_t is_data = !geo_disc_track_is_audio(track);
                     cd.status[0] = cd.drive_status | 0x05;
                     cd.status[1] = to_bcd(m);
                     cd.status[2] = to_bcd(s);
@@ -644,7 +644,7 @@ static void cd_comm_process_command(void) {
                     break;
                 }
                 case 0x06: { // End of disc check
-                    uint32_t lo = geo_chd_leadout();
+                    uint32_t lo = geo_disc_leadout();
                     if (cd.play_lba >= lo)
                         cd.drive_status = CD_STATUS_END;
                     cd.status[0] = cd.drive_status | 0x06;
@@ -652,9 +652,9 @@ static void cd_comm_process_command(void) {
                     cd.status[2] = 0;
                     cd.status[3] = 0;
                     uint8_t is_data = 0;
-                    for (unsigned i = 0; i < geo_chd_num_tracks(); ++i) {
-                        if (cd.play_lba >= geo_chd_track_start(i + 1))
-                            is_data = !geo_chd_track_is_audio(i + 1);
+                    for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
+                        if (cd.play_lba >= geo_disc_track_start(i + 1))
+                            is_data = !geo_disc_track_is_audio(i + 1);
                     }
                     cd.status[4] = is_data ? 0x40 : 0x00;
                     break;
@@ -683,7 +683,7 @@ static void cd_comm_process_command(void) {
             m = from_bcd(cd.cmd[1]);
             s = from_bcd(cd.cmd[2]);
             f = from_bcd(cd.cmd[3]);
-            uint32_t lba = geo_chd_msf_to_lba(m, s, f);
+            uint32_t lba = geo_disc_msf_to_lba(m, s, f);
             if (lba >= 150)
                 lba -= 150;
 
@@ -691,12 +691,12 @@ static void cd_comm_process_command(void) {
             cd.target_lba = lba;
 
             unsigned track = 0;
-            for (unsigned i = 0; i < geo_chd_num_tracks(); ++i) {
-                if (lba >= geo_chd_track_start(i + 1))
+            for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
+                if (lba >= geo_disc_track_start(i + 1))
                     track = i + 1;
             }
 
-            if (track > 0 && geo_chd_track_is_audio(track)) {
+            if (track > 0 && geo_disc_track_is_audio(track)) {
                 cd.playing_audio = 1;
                 cd.playing_data = 0;
                 cdda_playing = 1;
@@ -768,8 +768,8 @@ static void cd_comm_process_command(void) {
 
         case 0xB0: { // Move to track
             uint8_t track = from_bcd(cd.cmd[1]);
-            if (track >= 1 && track <= geo_chd_num_tracks()) {
-                cd.play_lba = geo_chd_track_start(track);
+            if (track >= 1 && track <= geo_disc_num_tracks()) {
+                cd.play_lba = geo_disc_track_start(track);
             }
             cd.drive_status = CD_STATUS_PLAY;
             cd.status[0] = cd.drive_status | 0x02;
@@ -1679,11 +1679,11 @@ void geo_cd_tick(unsigned mcycles) {
             // Determine audio vs data from current LBA's track type
             int is_audio = 0;
             unsigned cur_track = 0;
-            for (unsigned i = 0; i < geo_chd_num_tracks(); ++i) {
-                if (cd.play_lba >= geo_chd_track_start(i + 1))
+            for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
+                if (cd.play_lba >= geo_disc_track_start(i + 1))
                     cur_track = i + 1;
             }
-            if (cur_track > 0 && geo_chd_track_is_audio(cur_track))
+            if (cur_track > 0 && geo_disc_track_is_audio(cur_track))
                 is_audio = 1;
 
             cd.playing_audio = is_audio;
@@ -1702,10 +1702,10 @@ void geo_cd_tick(unsigned mcycles) {
             }
 
             // Audio sector: accumulate CDDA samples
-            if (cd.playing_audio && cd.play_lba < geo_chd_leadout()) {
+            if (cd.playing_audio && cd.play_lba < geo_disc_leadout()) {
                 if (cdda_samples + CDDA_SAMPLES_PER_SECTOR <= CDDA_BUF_MAXSAMPLES) {
                     int16_t *dst = cdda_buf + (cdda_samples * 2);
-                    if (geo_chd_read_audio(cd.play_lba, dst)) {
+                    if (geo_disc_read_audio(cd.play_lba, dst)) {
                         cdda_samples += CDDA_SAMPLES_PER_SECTOR;
                     } else {
                         memset(dst, 0, CDDA_SAMPLES_PER_SECTOR * 2 * sizeof(int16_t));
@@ -1980,6 +1980,10 @@ void geo_cd_reset(void) {
 // =========================================================================
 const void* geo_cd_backup_ram_ptr(void) {
     return backup_ram;
+}
+
+const void* geo_cd_pram_ptr(void) {
+    return pram;
 }
 
 // =========================================================================
