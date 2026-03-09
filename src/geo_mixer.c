@@ -72,12 +72,25 @@ static void geo_mixer_mix_cdda(size_t outsamps) {
     if (!cdda_buf || !cdda_in)
         return;
 
+    // Lazy-init: system type isn't known at retro_init() time.
+    // In raw mode (libretro default), output is at YM2610 rate.
+    // In resamp mode, output is at the configured samplerate.
+    if (!cdda_resampler) {
+        unsigned target = resampler ? samplerate : SAMPLERATE_YM2610;
+        cdda_resampler = speex_resampler_init(2, SAMPLERATE_CDDA, target, 3, &err);
+        if (!cdda_resampler)
+            return;
+    }
+
     spx_uint32_t in_len = cdda_in;
     spx_uint32_t out_len = outsamps;
 
     err = speex_resampler_process_interleaved_int(cdda_resampler,
         (spx_int16_t*)cdda_buf, &in_len,
         (spx_int16_t*)cdda_resamp_buf, &out_len);
+
+    // Keep unconsumed input samples for next frame
+    geo_cd_cdda_consume(in_len);
 
     // Mix CDDA into the output buffer (stereo interleaved)
     size_t total = out_len << 1;
@@ -99,7 +112,6 @@ static void geo_mixer_resamp(size_t in_ym) {
         (spx_int16_t*)ybuf, &insamps, (spx_int16_t*)abuf, &outsamps);
 
     geo_mixer_mix_cdda(outsamps);
-    geo_cd_cdda_clear();
 
     geo_mixer_cb(outsamps << 1);
 }
@@ -107,10 +119,13 @@ static void geo_mixer_resamp(size_t in_ym) {
 // Pass raw samples (no resampling) back to the frontend
 static void geo_mixer_raw(size_t in_ym) {
     int16_t *ybuf = geo_ymfm_get_buffer();
-    in_ym <<= 1; // Stereo
+    size_t frames = in_ym; // Stereo frames before doubling
 
+    in_ym <<= 1; // Stereo
     for (size_t i = 0; i < in_ym; ++i)
         abuf[i] = ybuf[i];
+
+    geo_mixer_mix_cdda(frames);
 
     geo_mixer_cb(in_ym);
 }
