@@ -60,6 +60,7 @@ void geo_cd_m68k_write_16(unsigned address, unsigned value);
 
 // VBL masking (irqMask2 bits 4+5 must be set)
 int geo_cd_vbl_enabled(void);
+void geo_cd_set_vbl_pending(void);
 
 // CDDA audio access for mixer
 int geo_cd_is_playing_cdda(void);
@@ -73,5 +74,18 @@ size_t geo_cd_state_size(void);
 
 // Backup RAM access for save data
 const void* geo_cd_backup_ram_ptr(void);
+
+// BIOS family detection
+#define CD_BIOS_UNKNOWN     0
+#define CD_BIOS_FRONT       1
+#define CD_BIOS_TOP         2
+#define CD_BIOS_CDZ         3
+
+int geo_cd_detect_bios(uint8_t *bios, size_t sz);
+void geo_cd_set_speed_hack(int enabled);
+
+// Loading skip — returns 1 if a CD sector was decoded this frame
+int geo_cd_sector_decoded_this_frame(void);
+void geo_cd_clear_sector_decoded(void);
 
 #endif

@@ -173,6 +173,7 @@ static uint8_t cd_irq_mask = 0;        // FF000F acknowledge bits
 static uint8_t cd_irq_enabled = 0;     // FF0181
 static uint16_t irq_mask1 = 0;         // FF0002: CDROM interrupt mask
 static uint16_t irq_mask2 = 0;         // FF0004: VBL interrupt mask (VITAL)
+static int vbl_pending = 0;            // Latched VBL when irq_mask2 wasn't ready
 uint32_t cd_irq_vector = 0;            // CD interrupt vector (0x54 or 0x58)
 
 // Pending CD interrupt sources
@@ -262,6 +263,10 @@ static inline uint16_t reverse_bits_16(uint16_t val) {
 
 static uint32_t cd_sector_counter = 0;
 static uint32_t cd_sector_rate = CD_SECTOR_RATE_1X;
+
+static int speed_hack_enabled = 0;
+static int bios_family = CD_BIOS_UNKNOWN;
+static int sector_decoded_this_frame = 0;
 
 // CDDA audio buffer (one CD frame = 588 stereo samples)
 #define CDDA_SAMPLES_PER_FRAME 588
@@ -1247,6 +1252,11 @@ static void cd_reg_write_16(uint32_t addr, uint16_t val) {
 
         case 0x0004: // VBL Interrupt Mask (VITAL)
             irq_mask2 = val;
+            // Fire latched VBL if mask just became ready
+            if (vbl_pending && (irq_mask2 & 0x030) == 0x030) {
+                vbl_pending = 0;
+                geo_m68k_interrupt(irq_vbl_level);
+            }
             return;
 
         // Unknown word registers (silently accepted)
@@ -1678,6 +1688,7 @@ void geo_cd_tick(unsigned mcycles) {
                 !(lc.ifstat & LC_IFSTAT_DECI)) {
                 cd_irq_mask |= 0x20;
                 cd_pending_irq |= CD_INT_DECODER;
+                sector_decoded_this_frame = 1;
             }
 
             // Advance position
@@ -1708,11 +1719,13 @@ void geo_cd_tick(unsigned mcycles) {
 // =========================================================================
 // VBL Masking
 // =========================================================================
-uint32_t cd_vbl_counter = 0;
 int geo_cd_vbl_enabled(void) {
-    if ((irq_mask2 & 0x030) == 0x030)
-        cd_vbl_counter++;
     return (irq_mask2 & 0x030) == 0x030;
+}
+
+// Called by LSPC at VBL time — if mask isn't ready, latch as pending
+void geo_cd_set_vbl_pending(void) {
+    vbl_pending = 1;
 }
 
 // =========================================================================
@@ -1733,31 +1746,133 @@ size_t geo_cd_get_cdda_samples(void) {
 // =========================================================================
 // Init/Reset/Deinit
 // =========================================================================
+// =========================================================================
+// BIOS Detection and Patching
+// =========================================================================
+
+// Check for a pattern at a BIOS offset (addresses relative to C00000)
+static int bios_pattern(uint8_t *bios, size_t sz, uint32_t offset,
+                        const uint8_t *pat, size_t patsz) {
+    if (offset + patsz > sz) return 0;
+    return memcmp(bios + offset, pat, patsz) == 0;
+}
+
+// Apply a patch at a BIOS offset
+static void bios_patch(uint8_t *bios, size_t sz, uint32_t offset,
+                       const uint8_t *pat, size_t patsz) {
+    if (offset + patsz > sz) return;
+    memcpy(bios + offset, pat, patsz);
+}
+
+// NOP instruction (4E71) and STOP #$2000 + NOP (halt CPU until IRQ, supervisor mode)
+static const uint8_t NOP2[] = { 0x4E, 0x71 };
+static const uint8_t STOP_NOP[] = { 0x4E, 0x72, 0x20, 0x00, 0x4E, 0x71 };
+
+int geo_cd_detect_bios(uint8_t *bios, size_t sz) {
+    // Validity check: first 4 bytes must be 00 10 F3 00
+    static const uint8_t valid[] = { 0x00, 0x10, 0xF3, 0x00 };
+    if (!bios_pattern(bios, sz, 0x0000, valid, 4))
+        return CD_BIOS_UNKNOWN;
+
+    // Family detection from reset vector area at 0x006C
+    static const uint8_t pat_front[] = { 0x00, 0xC0, 0xC8, 0x5E };
+    static const uint8_t pat_top[]   = { 0x00, 0xC0, 0xC2, 0x22 };
+    static const uint8_t pat_cdz[]   = { 0x00, 0xC0, 0xA3, 0xE8 };
+
+    if (bios_pattern(bios, sz, 0x006C, pat_cdz, 4))
+        return CD_BIOS_CDZ;
+    if (bios_pattern(bios, sz, 0x006C, pat_top, 4))
+        return CD_BIOS_TOP;
+    if (bios_pattern(bios, sz, 0x006C, pat_front, 4))
+        return CD_BIOS_FRONT;
+
+    return CD_BIOS_UNKNOWN;
+}
+
+// Apply CD recognition bypass patches (protection check skip)
+static void bios_patch_recognition(uint8_t *bios, size_t sz, int family) {
+    switch (family) {
+        case CD_BIOS_CDZ:
+            // C0EB82: BNE.S -> NOP
+            if (bios_pattern(bios, sz, 0xEB82, (uint8_t[]){0x66,0x10}, 2))
+                bios_patch(bios, sz, 0xEB82, NOP2, 2);
+            // C0D280: BNE.S -> NOP
+            if (bios_pattern(bios, sz, 0xD280, (uint8_t[]){0x66,0x74}, 2))
+                bios_patch(bios, sz, 0xD280, NOP2, 2);
+            break;
+        case CD_BIOS_FRONT:
+            // C10B64: BNE.S -> NOP
+            if (bios_pattern(bios, sz, 0x10B64, (uint8_t[]){0x66,0x04}, 2))
+                bios_patch(bios, sz, 0x10B64, NOP2, 2);
+            break;
+        case CD_BIOS_TOP:
+            // C10436: BNE.S -> NOP
+            if (bios_pattern(bios, sz, 0x10436, (uint8_t[]){0x66,0x04}, 2))
+                bios_patch(bios, sz, 0x10436, NOP2, 2);
+            break;
+    }
+}
+
+// Apply speed hack patches (replace busy-wait loops with STOP)
+static void bios_patch_speed_hack(uint8_t *bios, size_t sz, int family) {
+    // Each patch replaces SUBQ.L #1,D1; BEQ.W xxxx (53 81 67 00 xx xx)
+    // with STOP #0; NOP; NOP (73 00 4E 71 4E 71)
+    static const uint8_t subq_beq[] = { 0x53, 0x81, 0x67, 0x00 };
+
+    switch (family) {
+        case CD_BIOS_CDZ: {
+            static const uint32_t addrs[] = {0xE6E0, 0xE724, 0xE764, 0xE836, 0xE860};
+            for (int i = 0; i < 5; ++i)
+                if (bios_pattern(bios, sz, addrs[i], subq_beq, 4))
+                    bios_patch(bios, sz, addrs[i], STOP_NOP, 6);
+            break;
+        }
+        case CD_BIOS_FRONT: {
+            static const uint32_t addrs[] = {0x10716, 0x10758, 0x10798, 0x10864};
+            for (int i = 0; i < 4; ++i)
+                if (bios_pattern(bios, sz, addrs[i], subq_beq, 4))
+                    bios_patch(bios, sz, addrs[i], STOP_NOP, 6);
+            break;
+        }
+        case CD_BIOS_TOP: {
+            static const uint32_t addrs[] = {0x0FFCA, 0x1000E, 0x1004E, 0x10120};
+            for (int i = 0; i < 4; ++i)
+                if (bios_pattern(bios, sz, addrs[i], subq_beq, 4))
+                    bios_patch(bios, sz, addrs[i], STOP_NOP, 6);
+            break;
+        }
+    }
+}
+
+void geo_cd_set_speed_hack(int enabled) {
+    speed_hack_enabled = enabled;
+}
+
+int geo_cd_sector_decoded_this_frame(void) {
+    return sector_decoded_this_frame;
+}
+
+void geo_cd_clear_sector_decoded(void) {
+    sector_decoded_this_frame = 0;
+}
+
 void geo_cd_init(void) {
     romdata = geo_romdata_ptr();
 
-    // HACK: Patch CDZ BIOS to skip disc recognition (copy protection)
-    // NOP out two branch instructions that
-    // gate the disc loading process on protection check results.
-    // BIOS data is already byte-swapped to M68K big-endian order by
-    // geo_m68k_postload() before this function is called.
-    if (romdata->b && romdata->bsz >= 0xEC00) {
-        // Patch 1: C0EB82 — BNE.B in decoder IRQ handler (66 10 -> 4E 71)
-        if (romdata->b[0xEB82] == 0x66 && romdata->b[0xEB83] == 0x10) {
-            romdata->b[0xEB82] = 0x4E; // NOP
-            romdata->b[0xEB83] = 0x71;
-            fprintf(stderr, "BIOS patch 1 applied at C0EB82\n");
-        } else {
-            fprintf(stderr, "BIOS patch 1 MISSED: %02x %02x\n", romdata->b[0xEB82], romdata->b[0xEB83]);
-        }
-        // Patch 2: C0D280 — BNE.B in disc load handler (66 74 -> 4E 71)
-        if (romdata->b[0xD280] == 0x66 && romdata->b[0xD281] == 0x74) {
-            romdata->b[0xD280] = 0x4E; // NOP
-            romdata->b[0xD281] = 0x71;
-            fprintf(stderr, "BIOS patch 2 applied at C0D280\n");
-        } else {
-            fprintf(stderr, "BIOS patch 2 MISSED: %02x %02x\n", romdata->b[0xD280], romdata->b[0xD281]);
-        }
+    // Detect BIOS family and apply patches
+    if (romdata->b && romdata->bsz >= SIZE_512K) {
+        bios_family = geo_cd_detect_bios(romdata->b, romdata->bsz);
+        geo_log(GEO_LOG_INF, "CD BIOS family: %s\n",
+            bios_family == CD_BIOS_CDZ ? "CDZ" :
+            bios_family == CD_BIOS_TOP ? "Top Loader" :
+            bios_family == CD_BIOS_FRONT ? "Front Loader" : "Unknown");
+
+        // Always apply recognition bypass (copy protection skip)
+        bios_patch_recognition(romdata->b, romdata->bsz, bios_family);
+
+        // Apply speed hack if enabled
+        if (speed_hack_enabled)
+            bios_patch_speed_hack(romdata->b, romdata->bsz, bios_family);
     }
 
     memset(pram, 0, SIZE_2M);
@@ -1813,6 +1928,7 @@ void geo_cd_reset(void) {
     cd_irq_enabled = 0;
     irq_mask1 = 0;
     irq_mask2 = 0;
+    vbl_pending = 0;
     cd_sector_counter = 0;
     cd_comm_counter = 0;
     cdda_playing = 0;
@@ -1842,7 +1958,8 @@ const void* geo_cd_backup_ram_ptr(void) {
 // =========================================================================
 size_t geo_cd_state_size(void) {
     return SIZE_2M + SIZE_4M + SIZE_1M + SIZE_64K + SIZE_128K + SIZE_8K +
-           sizeof(lc) + sizeof(cd) + sizeof(dma) + 64;
+           sizeof(lc) + sizeof(cd) + sizeof(dma) +
+           sizeof(cdda_buf) + 64;
 }
 
 void geo_cd_state_save(uint8_t *st) {
@@ -1871,6 +1988,21 @@ void geo_cd_state_save(uint8_t *st) {
     geo_serial_push8(st, cd_irq_mask);
     geo_serial_push8(st, cd_irq_enabled);
     geo_serial_push32(st, cd_sector_counter);
+
+    // Bus request and IRQ mask state
+    geo_serial_push8(st, busreq_spr);
+    geo_serial_push8(st, busreq_pcm);
+    geo_serial_push8(st, busreq_z80);
+    geo_serial_push8(st, busreq_fix);
+    geo_serial_push16(st, irq_mask1);
+    geo_serial_push16(st, irq_mask2);
+    geo_serial_push32(st, cd_comm_counter);
+    geo_serial_push32(st, cd_sector_rate);
+
+    // CDDA state
+    geo_serial_pushblk(st, (uint8_t*)cdda_buf, sizeof(cdda_buf));
+    geo_serial_push32(st, (uint32_t)cdda_samples);
+    geo_serial_push8(st, cdda_playing);
 }
 
 void geo_cd_state_load(uint8_t *st) {
@@ -1897,4 +2029,17 @@ void geo_cd_state_load(uint8_t *st) {
     cd_irq_mask = geo_serial_pop8(st);
     cd_irq_enabled = geo_serial_pop8(st);
     cd_sector_counter = geo_serial_pop32(st);
+
+    busreq_spr = geo_serial_pop8(st);
+    busreq_pcm = geo_serial_pop8(st);
+    busreq_z80 = geo_serial_pop8(st);
+    busreq_fix = geo_serial_pop8(st);
+    irq_mask1 = geo_serial_pop16(st);
+    irq_mask2 = geo_serial_pop16(st);
+    cd_comm_counter = geo_serial_pop32(st);
+    cd_sector_rate = geo_serial_pop32(st);
+
+    geo_serial_popblk((uint8_t*)cdda_buf, st, sizeof(cdda_buf));
+    cdda_samples = (size_t)geo_serial_pop32(st);
+    cdda_playing = geo_serial_pop8(st);
 }

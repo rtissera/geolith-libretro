@@ -402,7 +402,8 @@ void geo_lspc_palram_wr08(uint32_t addr, uint8_t data) {
         lspc.palram[(addr & 0x0fff) + (lspc.palbank * SIZE_4K)] |= (data << 8);
     }
 
-    geo_lspc_palconv(((addr >> 1) & 0x0fff) + (lspc.palbank * SIZE_4K), data);
+    uint16_t idx = (addr & 0x0fff) + (lspc.palbank * SIZE_4K);
+    geo_lspc_palconv(idx, lspc.palram[idx]);
 }
 
 // Write a value to the active bank of palette RAM
@@ -972,8 +973,14 @@ void geo_lspc_run(unsigned cycs) {
                 geo_lspc_aa();
             else if (lspc.scanline == LSPC_LINE_BORDER_BOTTOM + 1) {
                 // In CD mode, VBL is masked by irqMask2 bits 4+5
-                if (geo_get_system() < 0x03 || geo_cd_vbl_enabled())
+                if (geo_get_system() < 0x03) {
                     geo_m68k_interrupt(irq_vbl_level);
+                } else if (geo_cd_vbl_enabled()) {
+                    geo_m68k_interrupt(irq_vbl_level);
+                } else {
+                    // Latch VBL as pending — will fire when irq_mask2 enables it
+                    geo_cd_set_vbl_pending();
+                }
             }
         }
 
