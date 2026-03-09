@@ -66,6 +66,7 @@ void geo_cd_set_vbl_pending(void);
 int geo_cd_is_playing_cdda(void);
 int16_t* geo_cd_get_cdda_buffer(void);
 size_t geo_cd_get_cdda_samples(void);
+void geo_cd_cdda_clear(void);
 
 // State serialization
 void geo_cd_state_load(uint8_t *st);

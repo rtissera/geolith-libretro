@@ -268,9 +268,10 @@ static int speed_hack_enabled = 0;
 static int bios_family = CD_BIOS_UNKNOWN;
 static int sector_decoded_this_frame = 0;
 
-// CDDA audio buffer (one CD frame = 588 stereo samples)
-#define CDDA_SAMPLES_PER_FRAME 588
-static int16_t cdda_buf[CDDA_SAMPLES_PER_FRAME * 2]; // Stereo interleaved
+// CDDA audio buffer — accumulates across multiple sector reads per video frame
+#define CDDA_SAMPLES_PER_SECTOR 588
+#define CDDA_BUF_MAXSAMPLES (CDDA_SAMPLES_PER_SECTOR * 3)
+static int16_t cdda_buf[CDDA_BUF_MAXSAMPLES * 2]; // Stereo interleaved
 static size_t cdda_samples = 0;
 static uint8_t cdda_playing = 0;
 
@@ -531,7 +532,7 @@ static void cd_comm_process_command(void) {
 
     static int prot_done = 0;
 
-    if (prot_done && cd.cmd[0] != 0x00) {
+    if (cd.cmd[0] != 0x00) {
         geo_log(GEO_LOG_DBG, "CD CMD: %02x %02x %02x %02x %02x\n",
             cd.cmd[0], cd.cmd[1], cd.cmd[2], cd.cmd[3], cd.cmd[4]);
     }
@@ -1517,9 +1518,6 @@ void geo_cd_m68k_write_8(unsigned address, unsigned value) {
     address &= 0xffffff;
 
     if (address < 0x200000) { // Program RAM
-        if (address >= 0x126000 && address <= 0x12600b && value == 0 && pram[address] != 0)
-            fprintf(stderr, "CLEAR 126xxx: [%06x]=%02x->00 PC=%06x\n",
-                address, pram[address], m68k_get_reg(NULL, M68K_REG_PPC));
         pram[address] = value;
     }
     else if (address < 0x300000) { // Unused
@@ -1539,7 +1537,9 @@ void geo_cd_m68k_write_8(unsigned address, unsigned value) {
                 return; // RTC control (no RTC on CD)
 
             case 0x3a0001: geo_lspc_shadow_wr(0); return;
-            case 0x3a0003: vectable = 0; return; // REG_SWPBIOS
+            case 0x3a0003:
+                if (vectable != 0) geo_log(GEO_LOG_DBG, "VECTABLE: -> BIOS (PC=%06x)\n", m68k_get_reg(NULL, M68K_REG_PPC));
+                vectable = 0; return; // REG_SWPBIOS
             case 0x3a0005: return; // REG_CRDUNLOCK1
             case 0x3a0007: return; // REG_CRDLOCK2
             case 0x3a0009: return; // REG_CRDREGSEL
@@ -1549,7 +1549,9 @@ void geo_cd_m68k_write_8(unsigned address, unsigned value) {
             case 0x3a000d: reg_sramlock = 1; return;
             case 0x3a000f: geo_lspc_palram_bank(1); return;
             case 0x3a0011: geo_lspc_shadow_wr(1); return;
-            case 0x3a0013: vectable = 1; return; // REG_SWPROM (to PRAM)
+            case 0x3a0013:
+                if (vectable != 1) geo_log(GEO_LOG_DBG, "VECTABLE: -> PRAM (PC=%06x)\n", m68k_get_reg(NULL, M68K_REG_PPC));
+                vectable = 1; return; // REG_SWPROM (to PRAM)
             case 0x3a0015: return; // REG_CRDLOCK1
             case 0x3a0017: return; // REG_CRDUNLOCK2
             case 0x3a0019: return; // REG_CRDNORMAL
@@ -1673,15 +1675,23 @@ void geo_cd_tick(unsigned mcycles) {
     while (cd_sector_counter >= cd_sector_rate) {
         cd_sector_counter -= cd_sector_rate;
 
-        int is_playing = cd.playing_data || cd.playing_audio;
+        if (cd.playing_data || cd.playing_audio) {
+            // Determine audio vs data from current LBA's track type
+            int is_audio = 0;
+            unsigned cur_track = 0;
+            for (unsigned i = 0; i < geo_chd_num_tracks(); ++i) {
+                if (cd.play_lba >= geo_chd_track_start(i + 1))
+                    cur_track = i + 1;
+            }
+            if (cur_track > 0 && geo_chd_track_is_audio(cur_track))
+                is_audio = 1;
 
-        if (is_playing) {
-            // Decode sector (updates LC8951 state, clears DECI)
+            cd.playing_audio = is_audio;
+            cd.playing_data = !is_audio;
+            cdda_playing = is_audio;
+
             lc8951_sector_decoded();
 
-            // Check IRQ state AFTER sectorDecoded
-            // Checks CTRL0.DECEN, irqMask1, IFCTRL.DECIEN, IFSTAT.DECI
-            // all AFTER sectorDecoded() has run
             if (lc.decoder_enabled &&
                 (irq_mask1 & 0x500) == 0x500 &&
                 (lc.ifctrl & LC_IFCTRL_DECIEN) &&
@@ -1691,15 +1701,16 @@ void geo_cd_tick(unsigned mcycles) {
                 sector_decoded_this_frame = 1;
             }
 
-            // Advance position
-            if (cd.playing_audio) {
-                if (geo_chd_read_audio(cd.play_lba, cdda_buf)) {
-                    cdda_samples = CDDA_SAMPLES_PER_FRAME;
-                } else {
-                    // Past end of disc or read error — output silence
-                    // but keep playing (BIOS expects drive stays in PLAY status)
-                    memset(cdda_buf, 0, sizeof(cdda_buf));
-                    cdda_samples = CDDA_SAMPLES_PER_FRAME;
+            // Audio sector: accumulate CDDA samples
+            if (cd.playing_audio && cd.play_lba < geo_chd_leadout()) {
+                if (cdda_samples + CDDA_SAMPLES_PER_SECTOR <= CDDA_BUF_MAXSAMPLES) {
+                    int16_t *dst = cdda_buf + (cdda_samples * 2);
+                    if (geo_chd_read_audio(cd.play_lba, dst)) {
+                        cdda_samples += CDDA_SAMPLES_PER_SECTOR;
+                    } else {
+                        memset(dst, 0, CDDA_SAMPLES_PER_SECTOR * 2 * sizeof(int16_t));
+                        cdda_samples += CDDA_SAMPLES_PER_SECTOR;
+                    }
                 }
             }
             cd.play_lba++;
@@ -1741,6 +1752,10 @@ int16_t* geo_cd_get_cdda_buffer(void) {
 
 size_t geo_cd_get_cdda_samples(void) {
     return cdda_samples;
+}
+
+void geo_cd_cdda_clear(void) {
+    cdda_samples = 0;
 }
 
 // =========================================================================
@@ -1791,26 +1806,28 @@ int geo_cd_detect_bios(uint8_t *bios, size_t sz) {
 
 // Apply CD recognition bypass patches (protection check skip)
 static void bios_patch_recognition(uint8_t *bios, size_t sz, int family) {
+    int applied = 0;
     switch (family) {
         case CD_BIOS_CDZ:
-            // C0EB82: BNE.S -> NOP
-            if (bios_pattern(bios, sz, 0xEB82, (uint8_t[]){0x66,0x10}, 2))
-                bios_patch(bios, sz, 0xEB82, NOP2, 2);
-            // C0D280: BNE.S -> NOP
-            if (bios_pattern(bios, sz, 0xD280, (uint8_t[]){0x66,0x74}, 2))
-                bios_patch(bios, sz, 0xD280, NOP2, 2);
+            if (bios_pattern(bios, sz, 0xEB82, (uint8_t[]){0x66,0x10}, 2)) {
+                bios_patch(bios, sz, 0xEB82, NOP2, 2); applied++;
+            }
+            if (bios_pattern(bios, sz, 0xD280, (uint8_t[]){0x66,0x74}, 2)) {
+                bios_patch(bios, sz, 0xD280, NOP2, 2); applied++;
+            }
             break;
         case CD_BIOS_FRONT:
-            // C10B64: BNE.S -> NOP
-            if (bios_pattern(bios, sz, 0x10B64, (uint8_t[]){0x66,0x04}, 2))
-                bios_patch(bios, sz, 0x10B64, NOP2, 2);
+            if (bios_pattern(bios, sz, 0x10B64, (uint8_t[]){0x66,0x04}, 2)) {
+                bios_patch(bios, sz, 0x10B64, NOP2, 2); applied++;
+            }
             break;
         case CD_BIOS_TOP:
-            // C10436: BNE.S -> NOP
-            if (bios_pattern(bios, sz, 0x10436, (uint8_t[]){0x66,0x04}, 2))
-                bios_patch(bios, sz, 0x10436, NOP2, 2);
+            if (bios_pattern(bios, sz, 0x10436, (uint8_t[]){0x66,0x04}, 2)) {
+                bios_patch(bios, sz, 0x10436, NOP2, 2); applied++;
+            }
             break;
     }
+    geo_log(GEO_LOG_INF, "BIOS recognition patches applied: %d\n", applied);
 }
 
 // Apply speed hack patches (replace busy-wait loops with STOP)
@@ -1862,10 +1879,12 @@ void geo_cd_init(void) {
     // Detect BIOS family and apply patches
     if (romdata->b && romdata->bsz >= SIZE_512K) {
         bios_family = geo_cd_detect_bios(romdata->b, romdata->bsz);
-        geo_log(GEO_LOG_INF, "CD BIOS family: %s\n",
+        geo_log(GEO_LOG_INF, "CD BIOS family: %s (SP=%02x%02x%02x%02x vec6C=%02x%02x%02x%02x)\n",
             bios_family == CD_BIOS_CDZ ? "CDZ" :
             bios_family == CD_BIOS_TOP ? "Top Loader" :
-            bios_family == CD_BIOS_FRONT ? "Front Loader" : "Unknown");
+            bios_family == CD_BIOS_FRONT ? "Front Loader" : "Unknown",
+            romdata->b[0], romdata->b[1], romdata->b[2], romdata->b[3],
+            romdata->b[0x6C], romdata->b[0x6D], romdata->b[0x6E], romdata->b[0x6F]);
 
         // Always apply recognition bypass (copy protection skip)
         bios_patch_recognition(romdata->b, romdata->bsz, bios_family);
