@@ -270,13 +270,12 @@ int geo_chd_read_audio(uint32_t disc_lba, int16_t *buf) {
         return 0;
 
     // Audio frames are 2352 bytes = 588 stereo samples (16-bit interleaved)
-    // CHD stores audio as big-endian, swap to native little-endian
-    memcpy(buf, frame, GEO_CHD_SECTOR_SIZE);
-    uint8_t *p = (uint8_t*)buf;
+    // CHD stores audio as big-endian, swap to native little-endian in one pass
+    const uint8_t *src = frame;
+    uint8_t *dst = (uint8_t*)buf;
     for (unsigned i = 0; i < GEO_CHD_SECTOR_SIZE; i += 2) {
-        uint8_t tmp = p[i];
-        p[i] = p[i + 1];
-        p[i + 1] = tmp;
+        dst[i]     = src[i + 1];
+        dst[i + 1] = src[i];
     }
     return 1;
 }

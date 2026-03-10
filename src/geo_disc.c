@@ -37,99 +37,128 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "geo_chd.h"
 #include "geo_cue.h"
 
-#define BACKEND_NONE 0
-#define BACKEND_CHD  1
-#define BACKEND_CUE  2
-
-static int backend = BACKEND_NONE;
+// Function pointer dispatch — set once at open, zero overhead per call
+static int (*fn_read_sector)(uint32_t, uint8_t*);
+static int (*fn_read_audio)(uint32_t, int16_t*);
+static unsigned (*fn_num_tracks)(void);
+static int (*fn_track_is_audio)(unsigned);
+static uint32_t (*fn_track_start)(unsigned);
+static uint32_t (*fn_track_frames)(unsigned);
+static uint32_t (*fn_leadout)(void);
+static void (*fn_close)(void);
 
 static int detect_backend(const char *path) {
     const char *ext = strrchr(path, '.');
     if (!ext)
-        return BACKEND_NONE;
+        return 0;
     if (!strcasecmp(ext, ".chd"))
-        return BACKEND_CHD;
+        return 1;
     if (!strcasecmp(ext, ".cue"))
-        return BACKEND_CUE;
-    return BACKEND_NONE;
+        return 2;
+    return 0;
 }
 
+static void clear_dispatch(void) {
+    fn_read_sector = NULL;
+    fn_read_audio = NULL;
+    fn_num_tracks = NULL;
+    fn_track_is_audio = NULL;
+    fn_track_start = NULL;
+    fn_track_frames = NULL;
+    fn_leadout = NULL;
+    fn_close = NULL;
+}
+
+static unsigned stub_num_tracks(void) { return 0; }
+static int stub_read(uint32_t lba, uint8_t *buf) { (void)lba; (void)buf; return 0; }
+static int stub_read_audio(uint32_t lba, int16_t *buf) { (void)lba; (void)buf; return 0; }
+static int stub_track_is_audio(unsigned t) { (void)t; return 0; }
+static uint32_t stub_track_u32(unsigned t) { (void)t; return 0; }
+static uint32_t stub_leadout(void) { return 0; }
+
 int geo_disc_open(const char *path) {
-    backend = detect_backend(path);
+    int backend = detect_backend(path);
+    int ok = 0;
 
     switch (backend) {
-        case BACKEND_CHD:
-            return geo_chd_open(path);
-        case BACKEND_CUE:
-            return geo_cue_open(path);
+        case 1: // CHD
+            ok = geo_chd_open(path);
+            if (ok) {
+                fn_read_sector = geo_chd_read_sector;
+                fn_read_audio = geo_chd_read_audio;
+                fn_num_tracks = geo_chd_num_tracks;
+                fn_track_is_audio = geo_chd_track_is_audio;
+                fn_track_start = geo_chd_track_start;
+                fn_track_frames = geo_chd_track_frames;
+                fn_leadout = geo_chd_leadout;
+                fn_close = geo_chd_close;
+            }
+            break;
+        case 2: // CUE
+            ok = geo_cue_open(path);
+            if (ok) {
+                fn_read_sector = geo_cue_read_sector;
+                fn_read_audio = geo_cue_read_audio;
+                fn_num_tracks = geo_cue_num_tracks;
+                fn_track_is_audio = geo_cue_track_is_audio;
+                fn_track_start = geo_cue_track_start;
+                fn_track_frames = geo_cue_track_frames;
+                fn_leadout = geo_cue_leadout;
+                fn_close = geo_cue_close;
+            }
+            break;
         default:
             geo_log(GEO_LOG_ERR, "Unsupported disc format: %s\n", path);
-            return 0;
+            break;
     }
+
+    if (!ok) {
+        // Set stubs so callers don't need NULL checks
+        fn_read_sector = stub_read;
+        fn_read_audio = stub_read_audio;
+        fn_num_tracks = stub_num_tracks;
+        fn_track_is_audio = stub_track_is_audio;
+        fn_track_start = stub_track_u32;
+        fn_track_frames = stub_track_u32;
+        fn_leadout = stub_leadout;
+        fn_close = NULL;
+    }
+
+    return ok;
 }
 
 void geo_disc_close(void) {
-    switch (backend) {
-        case BACKEND_CHD: geo_chd_close(); break;
-        case BACKEND_CUE: geo_cue_close(); break;
-    }
-    backend = BACKEND_NONE;
+    if (fn_close)
+        fn_close();
+    clear_dispatch();
 }
 
 int geo_disc_read_sector(uint32_t disc_lba, uint8_t *buf) {
-    switch (backend) {
-        case BACKEND_CHD: return geo_chd_read_sector(disc_lba, buf);
-        case BACKEND_CUE: return geo_cue_read_sector(disc_lba, buf);
-        default: return 0;
-    }
+    return fn_read_sector(disc_lba, buf);
 }
 
 int geo_disc_read_audio(uint32_t disc_lba, int16_t *buf) {
-    switch (backend) {
-        case BACKEND_CHD: return geo_chd_read_audio(disc_lba, buf);
-        case BACKEND_CUE: return geo_cue_read_audio(disc_lba, buf);
-        default: return 0;
-    }
+    return fn_read_audio(disc_lba, buf);
 }
 
 unsigned geo_disc_num_tracks(void) {
-    switch (backend) {
-        case BACKEND_CHD: return geo_chd_num_tracks();
-        case BACKEND_CUE: return geo_cue_num_tracks();
-        default: return 0;
-    }
+    return fn_num_tracks();
 }
 
 int geo_disc_track_is_audio(unsigned track) {
-    switch (backend) {
-        case BACKEND_CHD: return geo_chd_track_is_audio(track);
-        case BACKEND_CUE: return geo_cue_track_is_audio(track);
-        default: return 0;
-    }
+    return fn_track_is_audio(track);
 }
 
 uint32_t geo_disc_track_start(unsigned track) {
-    switch (backend) {
-        case BACKEND_CHD: return geo_chd_track_start(track);
-        case BACKEND_CUE: return geo_cue_track_start(track);
-        default: return 0;
-    }
+    return fn_track_start(track);
 }
 
 uint32_t geo_disc_track_frames(unsigned track) {
-    switch (backend) {
-        case BACKEND_CHD: return geo_chd_track_frames(track);
-        case BACKEND_CUE: return geo_cue_track_frames(track);
-        default: return 0;
-    }
+    return fn_track_frames(track);
 }
 
 uint32_t geo_disc_leadout(void) {
-    switch (backend) {
-        case BACKEND_CHD: return geo_chd_leadout();
-        case BACKEND_CUE: return geo_cue_leadout();
-        default: return 0;
-    }
+    return fn_leadout();
 }
 
 void geo_disc_lba_to_msf(uint32_t lba, uint8_t *m, uint8_t *s, uint8_t *f) {

@@ -331,6 +331,10 @@ void geo_lspc_set_cd_mode(int enabled) {
     lspc.cd_mode = enabled ? 1 : 0;
 }
 
+void geo_lspc_set_skip_rendering(int skip) {
+    lspc.skip_rendering = skip ? 1 : 0;
+}
+
 // Perform post-load operations for C ROM
 void geo_lspc_postload(void) {
     crommask = geo_calc_mask(32, romdata->csz >> 7);
@@ -935,6 +939,9 @@ static inline void geo_lspc_aa(void) {
 }
 
 static void geo_lspc_scanline(void) {
+    if (lspc.skip_rendering)
+        return;
+
     if (lspc.scanline >= LSPC_LINE_BORDER_TOP &&
         lspc.scanline < LSPC_LINE_BORDER_BOTTOM) {
         geo_lspc_bdsprline();

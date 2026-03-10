@@ -87,22 +87,24 @@ typedef struct _lc8951_t {
     uint8_t regs[16];       // Registers 0-15
     uint8_t regptr;         // Current register pointer
 
-    uint8_t buffer[SIZE_64K]; // 64K sector buffer (circular)
-    uint16_t wal;           // Write address (where next sector goes)
-    uint16_t ptl;           // Read pointer
-    uint16_t dacl;          // Data address counter
+    uint8_t buffer[SIZE_64K]; // 64K circular sector buffer (hardware-accurate)
+    uint16_t wal;           // Write address (where next sector header goes)
+    uint16_t ptl;           // Pointer (snapshot of WAL before sector write)
+    uint16_t dacl;          // Data address counter (DMA read position)
 
     uint8_t ctrl0;
     uint8_t ctrl1;
-    uint8_t ifstat;         // Interrupt flags
+    uint8_t ifstat;         // Interrupt flags (active-low: bit clear = pending)
     uint8_t ifctrl;         // Interrupt control
 
-    uint16_t dbc;           // Data byte count
+    uint16_t dbc;           // Data byte count (transfer length - 1)
     uint8_t head[4];        // Header (M, S, F, Mode)
     uint8_t stat0;          // Status 0 (CRCOK etc)
+    uint8_t stat1;          // Status 1
+    uint8_t stat2;          // Status 2 (from CTRL0/CTRL1)
+    uint8_t stat3;          // Status 3
 
     uint8_t decoder_enabled;
-    uint8_t transfer_busy;
 } lc8951_t;
 
 static lc8951_t lc;
@@ -124,6 +126,23 @@ static lc8951_t lc;
 // LC8951 CTRL0 bits
 #define LC_CTRL0_DECEN  0x80
 #define LC_CTRL0_AUTORQ 0x10
+
+// LC8951 CTRL1 bits
+#define LC_CTRL1_MODRQ  0x08
+#define LC_CTRL1_FORMRQ 0x04
+#define LC_CTRL1_SHDREN 0x01
+
+// Write into the 64K circular buffer with 16-bit position wrapping
+static void lc_buffer_write(uint16_t pos, const uint8_t *data, uint16_t len) {
+    uint32_t end = (uint32_t)pos + len;
+    if (end <= SIZE_64K) {
+        memcpy(&lc.buffer[pos], data, len);
+    } else {
+        uint32_t first = SIZE_64K - pos;
+        memcpy(&lc.buffer[pos], data, first);
+        memcpy(&lc.buffer[0], data + first, len - first);
+    }
+}
 
 // =========================================================================
 // CD Communication Protocol
@@ -197,22 +216,11 @@ static void cd_update_interrupts(void) {
         cd_irq_vector = 0x58;
     }
 
-    // Log when decoder is involved (separate counter from comm-only)
-    if (level && (cd_pending_irq & CD_INT_DECODER)) {
-        static int upd_dec_dbg = 0;
-        if (++upd_dec_dbg <= 20)
-            geo_log(GEO_LOG_DBG,
-                "cd_update_int[DEC]: vec=0x%02x pend=%02x SR=%04x\n",
-                cd_irq_vector, cd_pending_irq,
-                m68k_get_reg(NULL, M68K_REG_SR));
-    }
-
     if (level)
         geo_m68k_interrupt(IRQ_CD);
     else
         m68k_set_virq(IRQ_CD, 0);
 }
-static uint32_t cd_comm_counter = 0;   // Counter for 75Hz CD communication timer
 
 // Bit-reverse table for CDDA sample registers
 static const uint8_t bitrev[256] = {
@@ -268,12 +276,48 @@ static int speed_hack_enabled = 0;
 static int bios_family = CD_BIOS_UNKNOWN;
 static int sector_decoded_this_frame = 0;
 
+// Cached track lookup — avoids repeated forward scans through all tracks
+static unsigned cached_track = 1;
+static uint32_t cached_track_start = 0;
+static uint32_t cached_track_end = 0;
+
+// Find which 1-based track a disc LBA belongs to.
+// Uses backward search (first match wins) and caches the result.
+static unsigned find_track_for_lba(uint32_t lba) {
+    // Fast path: check cached track
+    if (lba >= cached_track_start && lba < cached_track_end)
+        return cached_track;
+
+    unsigned ntracks = geo_disc_num_tracks();
+    unsigned track = 1;
+    for (unsigned i = ntracks; i > 0; --i) {
+        if (lba >= geo_disc_track_start(i)) {
+            track = i;
+            break;
+        }
+    }
+
+    // Update cache
+    cached_track = track;
+    cached_track_start = geo_disc_track_start(track);
+    if (track < ntracks)
+        cached_track_end = geo_disc_track_start(track + 1);
+    else
+        cached_track_end = geo_disc_leadout();
+
+    return track;
+}
+
 // CDDA audio buffer — accumulates across multiple sector reads per video frame
 #define CDDA_SAMPLES_PER_SECTOR 588
 #define CDDA_BUF_MAXSAMPLES (CDDA_SAMPLES_PER_SECTOR * 3)
 static int16_t cdda_buf[CDDA_BUF_MAXSAMPLES * 2]; // Stereo interleaved
 static size_t cdda_samples = 0;
 static uint8_t cdda_playing = 0;
+
+// Master cycle counter within the frame — for cycle-accurate CDDA sample indexing
+#define MCYC_PER_FRAME_CD 405504
+static uint32_t cd_frame_mcycs = 0;
 
 // =========================================================================
 // Helper functions
@@ -331,44 +375,35 @@ static uint8_t lc8951_reg_read(void) {
         case 0x02: val = lc.dbc & 0xff; break;
         case 0x03: val = (lc.dbc >> 8) & 0x0f; break;
         case 0x04: // HEAD0 (returns 0 when SHDREN is set)
-            val = (lc.ctrl1 & 0x01) ? 0 : lc.head[0];
+            val = (lc.ctrl1 & LC_CTRL1_SHDREN) ? 0 : lc.head[0];
             break;
         case 0x05: // HEAD1
-            val = (lc.ctrl1 & 0x01) ? 0 : lc.head[1];
+            val = (lc.ctrl1 & LC_CTRL1_SHDREN) ? 0 : lc.head[1];
             break;
         case 0x06: // HEAD2
-            val = (lc.ctrl1 & 0x01) ? 0 : lc.head[2];
+            val = (lc.ctrl1 & LC_CTRL1_SHDREN) ? 0 : lc.head[2];
             break;
         case 0x07: // HEAD3
-            val = (lc.ctrl1 & 0x01) ? 0 : lc.head[3];
+            val = (lc.ctrl1 & LC_CTRL1_SHDREN) ? 0 : lc.head[3];
             break;
         case 0x08: val = lc.ptl & 0xff; break;
         case 0x09: val = (lc.ptl >> 8) & 0xff; break;
         case 0x0a: val = lc.wal & 0xff; break;
         case 0x0b: val = (lc.wal >> 8) & 0xff; break;
         case 0x0c: val = lc.stat0; break;
-        case 0x0d: // STAT1
-        case 0x0e: // STAT2
-            val = 0; break;
-        case 0x0f: // STAT3 - keep DECI pending on read
-            lc.ifstat &= ~LC_IFSTAT_DECI;
-            val = 0; break;
+        case 0x0d: val = lc.stat1; break;
+        case 0x0e: val = lc.stat2; break;
+        case 0x0f: // STAT3 — reading acknowledges DECI (set bit = no interrupt)
+            val = lc.stat3;
+            lc.ifstat |= LC_IFSTAT_DECI;
+            break;
     }
-
-    // Log reads of key registers only during playback (disabled for perf)
-    //if ((cd.playing_data || cd.playing_audio) && (reg == 0x01 || reg >= 0x08))
-    //    fprintf(stderr, "LC8951 read reg=%02x val=%02x @ PC=%06x\n",
-    //        reg, val, m68k_get_reg(NULL, M68K_REG_PPC));
 
     return val;
 }
 
 static void lc8951_reg_write(uint8_t val) {
     uint8_t reg = lc.regptr;
-
-    //if (cd.playing_data || cd.playing_audio)
-    //    fprintf(stderr, "LC8951 write reg=%02x val=%02x @ PC=%06x\n",
-    //        reg, val, m68k_get_reg(NULL, M68K_REG_PPC));
 
     // Auto-increment except register 0
     if (lc.regptr > 0) {
@@ -395,10 +430,9 @@ static void lc8951_reg_write(uint8_t val) {
         case 0x05: // DACH
             lc.dacl = (lc.dacl & 0x00ff) | (val << 8);
             break;
-        case 0x06: // DTRG - triggers data transfer
+        case 0x06: // DTRG — data transfer trigger
             if (lc.ifctrl & LC_IFCTRL_DOUTEN)
-                lc.ifstat &= ~LC_IFSTAT_DTBSY;
-            lc.transfer_busy = 1;
+                lc.ifstat &= ~LC_IFSTAT_DTBSY; // Clear DTBSY = transfer ready
             break;
         case 0x07: // DTACK - acknowledge transfer completion
             lc.ifstat |= LC_IFSTAT_DTEI; // Clear DTEI flag
@@ -434,16 +468,10 @@ static void lc8951_reg_write(uint8_t val) {
 }
 
 static void lc8951_sector_decoded(void) {
-    // If decoder not enabled, nothing to do
     if (!lc.decoder_enabled)
         return;
-    {
-        static uint32_t sec_count = 0;
-        if (++sec_count <= 20 || (sec_count % 500 == 0))
-            geo_log(GEO_LOG_DBG, "sector_decoded #%u: lba=%u\n", sec_count, cd.play_lba);
-    }
 
-    // Update head registers with current position MSF
+    // Update header with current MSF position
     uint8_t m, s, f;
     geo_disc_lba_to_msf(cd.play_lba + 150, &m, &s, &f);
     lc.head[0] = to_bcd(m);
@@ -451,36 +479,51 @@ static void lc8951_sector_decoded(void) {
     lc.head[2] = to_bcd(f);
     lc.head[3] = 0x01; // Mode 1
 
-    // If current track is not data, nothing more to do
     if (cd.playing_audio)
         return;
 
-    // Simplified LC8951: write 2048 bytes of user data at buffer[0]
-    // DMA always reads from buffer[0], ignoring DACL register
+    // Write 4-byte header + 2048-byte sector data into circular buffer at WAL
+    // BIOS protocol: reads PTL, sets DAC = PTL + 4 (skip header), DBC = 0x7FF
+    lc_buffer_write(lc.wal, lc.head, 4);
+
     uint8_t sector[GEO_DISC_DATA_SIZE];
-    if (geo_disc_read_sector(cd.play_lba, sector))
-        memcpy(lc.buffer, sector, GEO_DISC_DATA_SIZE);
+    geo_disc_read_sector(cd.play_lba, sector);
+    lc_buffer_write((uint16_t)(lc.wal + 4), sector, GEO_DISC_DATA_SIZE);
 
-    // Advance write address and pointer by one raw sector (for BIOS register reads)
+    // PTL = WAL (snapshot before advancing — tells BIOS where sector starts)
+    lc.ptl = lc.wal;
+
+    // Advance WAL by one raw sector (uint16_t wraps naturally at 64K boundary)
     lc.wal += GEO_DISC_SECTOR_SIZE;
-    lc.ptl += GEO_DISC_SECTOR_SIZE;
 
-    // Set STAT registers
+    // Set status registers
     lc.stat0 = 0x80; // CRCOK
+    lc.stat1 = 0;
 
-    // Set DECI flag (sector decoded interrupt pending)
+    // STAT2: reflects CTRL1 mode flags filtered by AUTORQ
+    if (lc.ctrl0 & LC_CTRL0_AUTORQ)
+        lc.stat2 = lc.ctrl1 & LC_CTRL1_MODRQ;
+    else
+        lc.stat2 = lc.ctrl1 & (LC_CTRL1_MODRQ | LC_CTRL1_FORMRQ);
+
+    lc.stat3 = 0;
+
+    // DECI: sector decoded interrupt pending (active-low: clear bit)
     lc.ifstat &= ~LC_IFSTAT_DECI;
 }
 
 static void lc8951_end_transfer(void) {
-    // Set DTBSY, update DAC/DBC, no interrupt
+    // Transfer complete — set DTBSY (active-low: bit set = not busy)
     lc.ifstat |= LC_IFSTAT_DTBSY;
 
-    // DAC += DBC + 1 (advance data address counter)
+    // Advance DAC by (DBC + 1), uint16_t wraps naturally
     lc.dacl += lc.dbc + 1;
 
     // Clear DBC
     lc.dbc = 0;
+
+    // Set DTEI pending (active-low: clear bit = interrupt pending)
+    lc.ifstat &= ~LC_IFSTAT_DTEI;
 }
 
 // =========================================================================
@@ -530,27 +573,15 @@ static void cd_comm_process_command(void) {
 
     uint8_t m, s, f;
 
-    static int prot_done = 0;
-
     if (cd.cmd[0] != 0x00) {
         geo_log(GEO_LOG_DBG, "CD CMD: %02x %02x %02x %02x %02x\n",
             cd.cmd[0], cd.cmd[1], cd.cmd[2], cd.cmd[3], cd.cmd[4]);
     }
 
     switch (cd.cmd[0]) {
-        case 0x00: { // Status
+        case 0x00: // Status
             cd.status[0] = (cd.status[0] & 0x0f) | cd.drive_status;
-            extern uint32_t cd_vbl_counter;
-            static int stat_count = 0;
-            stat_count++;
-            // Read BIOS state variables (a5=0x108000)
-            uint8_t b76ac = pram[0x10F6AC];
-            uint8_t b766a = pram[0x10F66A];
-            uint8_t b7650 = pram[0x10F650];
-            uint8_t b7651 = pram[0x10F651];
-            (void)stat_count; (void)b76ac; (void)b766a; (void)b7650; (void)b7651;
             break;
-        }
 
         case 0x10: // Stop
             cd.playing_audio = 0;
@@ -577,12 +608,8 @@ static void cd_comm_process_command(void) {
                     cd.status[1] = to_bcd(m);
                     cd.status[2] = to_bcd(s);
                     cd.status[3] = to_bcd(f);
-                    uint8_t is_data = 0;
-                    for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
-                        if (cd.play_lba >= geo_disc_track_start(i + 1))
-                            is_data = !geo_disc_track_is_audio(i + 1);
-                    }
-                    cd.status[4] = is_data ? 0x40 : 0x00;
+                    unsigned trk = find_track_for_lba(cd.play_lba);
+                    cd.status[4] = !geo_disc_track_is_audio(trk) ? 0x40 : 0x00;
                     break;
                 }
                 case 0x01: { // Current relative position
@@ -591,20 +618,12 @@ static void cd_comm_process_command(void) {
                     cd.status[1] = to_bcd(m);
                     cd.status[2] = to_bcd(s);
                     cd.status[3] = to_bcd(f);
-                    uint8_t is_data = 0;
-                    for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
-                        if (cd.play_lba >= geo_disc_track_start(i + 1))
-                            is_data = !geo_disc_track_is_audio(i + 1);
-                    }
-                    cd.status[4] = is_data ? 0x40 : 0x00;
+                    unsigned trk = find_track_for_lba(cd.play_lba);
+                    cd.status[4] = !geo_disc_track_is_audio(trk) ? 0x40 : 0x00;
                     break;
                 }
                 case 0x02: { // Current track
-                    uint8_t track = 1;
-                    for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
-                        if (cd.play_lba >= geo_disc_track_start(i + 1))
-                            track = i + 1;
-                    }
+                    unsigned track = find_track_for_lba(cd.play_lba);
                     uint8_t is_data = !geo_disc_track_is_audio(track);
                     cd.status[0] = cd.drive_status | 0x02;
                     cd.status[1] = to_bcd(track);
@@ -651,12 +670,8 @@ static void cd_comm_process_command(void) {
                     cd.status[1] = 0;
                     cd.status[2] = 0;
                     cd.status[3] = 0;
-                    uint8_t is_data = 0;
-                    for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
-                        if (cd.play_lba >= geo_disc_track_start(i + 1))
-                            is_data = !geo_disc_track_is_audio(i + 1);
-                    }
-                    cd.status[4] = is_data ? 0x40 : 0x00;
+                    unsigned trk = find_track_for_lba(cd.play_lba);
+                    cd.status[4] = !geo_disc_track_is_audio(trk) ? 0x40 : 0x00;
                     break;
                 }
                 case 0x07: // CDZ disc recognition (copy protection)
@@ -665,7 +680,6 @@ static void cd_comm_process_command(void) {
                     cd.status[2] = 0;
                     cd.status[3] = 0;
                     cd.status[4] = 0;
-                    prot_done = 1;
                     geo_log(GEO_LOG_DBG, "Protection check done\n");
                     break;
                 default:
@@ -690,13 +704,9 @@ static void cd_comm_process_command(void) {
             cd.play_lba = lba;
             cd.target_lba = lba;
 
-            unsigned track = 0;
-            for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
-                if (lba >= geo_disc_track_start(i + 1))
-                    track = i + 1;
-            }
+            unsigned track = find_track_for_lba(lba);
 
-            if (track > 0 && geo_disc_track_is_audio(track)) {
+            if (geo_disc_track_is_audio(track)) {
                 cd.playing_audio = 1;
                 cd.playing_data = 0;
                 cdda_playing = 1;
@@ -718,7 +728,14 @@ static void cd_comm_process_command(void) {
             break;
         }
 
-        case 0x40: // Seek
+        case 0x40: { // Seek
+            m = from_bcd(cd.cmd[1]);
+            s = from_bcd(cd.cmd[2]);
+            f = from_bcd(cd.cmd[3]);
+            uint32_t lba = geo_disc_msf_to_lba(m, s, f);
+            if (lba >= 150)
+                lba -= 150;
+            cd.play_lba = lba;
             cd.playing_audio = 0;
             cd.playing_data = 0;
             cdda_playing = 0;
@@ -729,6 +746,7 @@ static void cd_comm_process_command(void) {
             cd.status[3] = 0;
             cd.status[4] = 0;
             break;
+        }
 
         case 0x50: // Unknown (CDZ only)
             cd.status[0] = cd.drive_status;
@@ -753,7 +771,12 @@ static void cd_comm_process_command(void) {
 
         case 0x80: // Scan forward
             cd.play_lba += 75;
-            cd.drive_status = CD_STATUS_PLAY;
+            if (cd.play_lba >= geo_disc_leadout()) {
+                cd.play_lba = geo_disc_leadout() - 1;
+                cd.drive_status = CD_STATUS_END;
+            } else {
+                cd.drive_status = CD_STATUS_PLAY;
+            }
             cd.status[0] = CD_STATUS_SCAN;
             break;
 
@@ -788,8 +811,6 @@ static void cd_comm_process_command(void) {
             cd.status[2] = 0;
             cd.status[3] = 0;
             cd.status[4] = 0;
-            if (cd.cmd[0] == 0xE2)
-                prot_done = 2; // Phase 3: post-protection sequence
             break;
 
         default:
@@ -907,31 +928,43 @@ static void cd_dma_execute(void) {
     switch (dma.config) {
         case 0xffc5:
         case 0xff89: {
-            // Copy from LC8951 buffer to destination
-            // Reads big-endian words from LC8951 buffer, writes via mapped handler
-            uint16_t *source = (uint16_t*)lc.buffer;
+            // Copy from LC8951 circular buffer to destination
+            // Reads big-endian words from buffer[DAC] with 16-bit wrapping
+            if (lc.ifstat & LC_IFSTAT_DTBSY) {
+                geo_log(GEO_LOG_WRN, "DMA %04x: DTRG not written (DTBSY set)\n", dma.config);
+                break;
+            }
             uint32_t dst = dma.dst;
             uint32_t len = dma.len;
-            if (len > 0x400) len = 0x400;
+            uint32_t lc_words = (lc.dbc + 1) / 2;
+            if (lc_words > 0 && len > lc_words)
+                len = lc_words;
+            uint16_t dac = lc.dacl;
             for (uint32_t i = 0; i < len; ++i) {
-                uint16_t data = (source[i] >> 8) | (source[i] << 8); // big-endian
+                uint16_t data = ((uint16_t)lc.buffer[dac] << 8) | lc.buffer[(uint16_t)(dac + 1)];
                 dma_write_word(dst_ptr, dst_mask, &dst, data, dest_type);
+                dac += 2;
             }
             lc8951_end_transfer();
             break;
         }
         case 0xfc2d: {
-            // Copy from LC8951 buffer, odd bytes
-            // Reads word from LC8951 buffer, writes 2 words per iteration
-            // (high byte as word, low byte as word) through mapped handler
-            uint16_t *source = (uint16_t*)lc.buffer;
+            // Copy from LC8951 buffer, odd bytes (2 words per source word)
+            if (lc.ifstat & LC_IFSTAT_DTBSY) {
+                geo_log(GEO_LOG_WRN, "DMA fc2d: DTRG not written (DTBSY set)\n");
+                break;
+            }
             uint32_t dst = dma.dst;
             uint32_t len = dma.len;
-            if (len > 0x400) len = 0x400;
+            uint32_t lc_words = (lc.dbc + 1) / 2;
+            if (lc_words > 0 && len > lc_words)
+                len = lc_words;
+            uint16_t dac = lc.dacl;
             for (uint32_t i = 0; i < len; ++i) {
-                uint16_t data = (source[i] >> 8) | (source[i] << 8); // big-endian
+                uint16_t data = ((uint16_t)lc.buffer[dac] << 8) | lc.buffer[(uint16_t)(dac + 1)];
                 dma_write_word(dst_ptr, dst_mask, &dst, data >> 8, dest_type);
                 dma_write_word(dst_ptr, dst_mask, &dst, data, dest_type);
+                dac += 2;
             }
             lc8951_end_transfer();
             break;
@@ -939,14 +972,28 @@ static void cd_dma_execute(void) {
         case 0xfe3d:
         case 0xfe6d: {
             // RAM to RAM copy — source and destination registers are REVERSED
-            // Reads word from source, writes word to dest via mapped handler
             uint32_t src = dma.dst;   // Hardware "destination" register is actually source
             uint32_t dst = dma.src;   // Hardware "source" register is actually destination
-            // Re-resolve destination from the actual destination address
+
             dest_type = cd_dma_resolve_dest(dst, &dst_ptr, &dst_mask);
             if (!dst_ptr) {
                 geo_log(GEO_LOG_WRN, "DMA fe3d to unknown address: %06x\n", dst);
                 break;
+            }
+
+            // Inhibit blank vector table writes (Double Dragon fix):
+            // Some games zero the vector table before loading real vectors.
+            // If we write the zeros, the next interrupt hits address 0 → crash.
+            if ((dst & 0xffffff) < 0x80) {
+                int blank = 1;
+                for (uint32_t i = 0; i < dma.len && blank; ++i) {
+                    if (read16(pram, (src + i * 2) & (SIZE_2M - 1)))
+                        blank = 0;
+                }
+                if (blank) {
+                    geo_log(GEO_LOG_DBG, "DMA: inhibit blank vector table write\n");
+                    break;
+                }
             }
 
             for (uint32_t i = 0; i < dma.len; ++i) {
@@ -1078,14 +1125,16 @@ static uint16_t cd_reg_read_16(uint32_t addr) {
         }
 
         case 0x0188: // CDDA left channel (bit-reversed)
-            if (cdda_playing && cdda_samples > 0)
-                return reverse_bits_16((uint16_t)cdda_buf[0]);
-            return 0;
-
-        case 0x018a: // CDDA right channel (bit-reversed)
-            if (cdda_playing && cdda_samples > 0)
-                return reverse_bits_16((uint16_t)cdda_buf[1]);
-            return 0;
+        case 0x018a: { // CDDA right channel (bit-reversed)
+            if (!cdda_playing || cdda_samples == 0)
+                return 0;
+            // Map current master cycle position to a sample index in the buffer
+            size_t idx = (size_t)cd_frame_mcycs * cdda_samples / MCYC_PER_FRAME_CD;
+            if (idx >= cdda_samples)
+                idx = cdda_samples - 1;
+            int ch = (addr == 0x018a) ? 1 : 0;
+            return reverse_bits_16((uint16_t)cdda_buf[idx * 2 + ch]);
+        }
     }
 
     // Fall through to byte handler for registers not word-specific
@@ -1123,9 +1172,9 @@ static void cd_reg_write_8(uint32_t addr, uint8_t val) {
         case 0x0061: // DMA control
             if (val == 0x40) {
                 uint8_t handler = pram[0x10FE0F]; // 7E0F(a5) where a5=0x108000
-                geo_log(GEO_LOG_DBG, "DMA: dst=%06x len=%04x cfg=%04x src=%06x h=%u buf=%02x%02x%02x%02x\n",
+                geo_log(GEO_LOG_DBG, "DMA: dst=%06x len=%04x cfg=%04x src=%06x h=%u dac=%04x dbc=%04x\n",
                     dma.dst, dma.len, dma.config, dma.src, handler,
-                    lc.buffer[0], lc.buffer[1], lc.buffer[2], lc.buffer[3]);
+                    lc.dacl, lc.dbc);
                 dma.enabled = 1;
                 cd_dma_execute();
             } else if (val == 0x00) {
@@ -1658,6 +1707,7 @@ void geo_cd_m68k_write_16(unsigned address, unsigned value) {
 
 void geo_cd_tick(unsigned mcycles) {
     cd_sector_counter += mcycles;
+    cd_frame_mcycs += mcycles;
 
     // Set timer rate based on play state
     int is_playing = cd.playing_data || cd.playing_audio;
@@ -1677,14 +1727,8 @@ void geo_cd_tick(unsigned mcycles) {
 
         if (cd.playing_data || cd.playing_audio) {
             // Determine audio vs data from current LBA's track type
-            int is_audio = 0;
-            unsigned cur_track = 0;
-            for (unsigned i = 0; i < geo_disc_num_tracks(); ++i) {
-                if (cd.play_lba >= geo_disc_track_start(i + 1))
-                    cur_track = i + 1;
-            }
-            if (cur_track > 0 && geo_disc_track_is_audio(cur_track))
-                is_audio = 1;
+            unsigned cur_track = find_track_for_lba(cd.play_lba);
+            int is_audio = geo_disc_track_is_audio(cur_track);
 
             cd.playing_audio = is_audio;
             cd.playing_data = !is_audio;
@@ -1759,6 +1803,9 @@ void geo_cd_cdda_clear(void) {
 }
 
 void geo_cd_cdda_consume(size_t consumed) {
+    // Reset frame cycle counter — consume is called once per frame by the mixer
+    cd_frame_mcycs = 0;
+
     if (consumed >= cdda_samples) {
         cdda_samples = 0;
         return;
@@ -1959,9 +2006,12 @@ void geo_cd_reset(void) {
     irq_mask2 = 0;
     vbl_pending = 0;
     cd_sector_counter = 0;
-    cd_comm_counter = 0;
     cdda_playing = 0;
     cdda_samples = 0;
+    cd_frame_mcycs = 0;
+    cached_track = 1;
+    cached_track_start = 0;
+    cached_track_end = 0;
 
     lc8951_reset();
     cd_comm_reset();
@@ -1992,7 +2042,7 @@ const void* geo_cd_pram_ptr(void) {
 size_t geo_cd_state_size(void) {
     return SIZE_2M + SIZE_4M + SIZE_1M + SIZE_64K + SIZE_128K + SIZE_8K +
            sizeof(lc) + sizeof(cd) + sizeof(dma) +
-           sizeof(cdda_buf) + 64;
+           sizeof(cdda_buf) + 128;
 }
 
 void geo_cd_state_save(uint8_t *st) {
@@ -2029,8 +2079,14 @@ void geo_cd_state_save(uint8_t *st) {
     geo_serial_push8(st, busreq_fix);
     geo_serial_push16(st, irq_mask1);
     geo_serial_push16(st, irq_mask2);
-    geo_serial_push32(st, cd_comm_counter);
     geo_serial_push32(st, cd_sector_rate);
+
+    // IRQ state
+    geo_serial_push8(st, cd_pending_irq);
+    geo_serial_push8(st, vbl_pending);
+    geo_serial_push32(st, cd_irq_vector);
+    geo_serial_push8(st, sector_decoded_this_frame);
+    geo_serial_push32(st, cd_frame_mcycs);
 
     // CDDA state
     geo_serial_pushblk(st, (uint8_t*)cdda_buf, sizeof(cdda_buf));
@@ -2069,10 +2125,22 @@ void geo_cd_state_load(uint8_t *st) {
     busreq_fix = geo_serial_pop8(st);
     irq_mask1 = geo_serial_pop16(st);
     irq_mask2 = geo_serial_pop16(st);
-    cd_comm_counter = geo_serial_pop32(st);
     cd_sector_rate = geo_serial_pop32(st);
+
+    cd_pending_irq = geo_serial_pop8(st);
+    vbl_pending = geo_serial_pop8(st);
+    cd_irq_vector = geo_serial_pop32(st);
+    sector_decoded_this_frame = geo_serial_pop8(st);
+    cd_frame_mcycs = geo_serial_pop32(st);
 
     geo_serial_popblk((uint8_t*)cdda_buf, st, sizeof(cdda_buf));
     cdda_samples = (size_t)geo_serial_pop32(st);
     cdda_playing = geo_serial_pop8(st);
+
+    // Rebuild track cache from current position
+    cached_track = 1;
+    cached_track_start = 0;
+    cached_track_end = 0;
+    if (geo_disc_num_tracks() > 0)
+        find_track_for_lba(cd.play_lba);
 }

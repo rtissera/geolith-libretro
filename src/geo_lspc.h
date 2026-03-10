@@ -87,6 +87,9 @@ typedef struct _lspc_t {
 
     // CD mode: sprite tile data uses non-interleaved byte ordering
     uint8_t cd_mode;
+
+    // Skip rendering during CD loading fast-forward
+    uint8_t skip_rendering;
 } lspc_t;
 
 void geo_lspc_set_buffer(uint32_t*);
@@ -95,6 +98,7 @@ void geo_lspc_set_fix(unsigned);
 void geo_lspc_set_sprlimit(unsigned);
 void geo_lspc_set_palette(unsigned);
 void geo_lspc_set_cd_mode(int);
+void geo_lspc_set_skip_rendering(int);
 
 void geo_lspc_postload(void);
 

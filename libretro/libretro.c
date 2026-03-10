@@ -68,8 +68,8 @@ static void *romdata = NULL;
 static int cd_mode = 0;
 static int cd_systype = SYSTEM_CDZ;
 static int cd_bios_unibios = 0;
-static int cd_speed_hack = 1;
-static int cd_skip_loading = 1;
+static int cd_speed_hack = 0;
+static int cd_skip_loading = 0;
 
 // Game name without path or extension
 static char gamename[128];
@@ -648,22 +648,6 @@ static void check_variables(bool first_run) {
             }
         }
 
-        // CD Speed Hack
-        var.key   = "geolith_cd_speed_hack";
-        var.value = NULL;
-
-        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-            cd_speed_hack = !strcmp(var.value, "enabled");
-        }
-
-        // CD Skip Loading
-        var.key   = "geolith_cd_skip_loading";
-        var.value = NULL;
-
-        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-            cd_skip_loading = !strcmp(var.value, "enabled");
-        }
-
         // Universe BIOS Hardware
         var.key   = "geolith_unibios_hw";
         var.value = NULL;
@@ -726,6 +710,24 @@ static void check_variables(bool first_run) {
             else
                 force_int_timing = 0;
         }
+    }
+
+    // CD Speed Hack
+    var.key   = "geolith_cd_speed_hack";
+    var.value = NULL;
+
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+        cd_speed_hack = !strcmp(var.value, "enabled");
+        if (cd_mode)
+            geo_cd_set_speed_hack(cd_speed_hack);
+    }
+
+    // CD Skip Loading
+    var.key   = "geolith_cd_skip_loading";
+    var.value = NULL;
+
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+        cd_skip_loading = !strcmp(var.value, "enabled");
     }
 
     // Memory Card Inserted
@@ -1071,19 +1073,32 @@ void retro_reset(void) {
 }
 
 void retro_run(void) {
-    geo_exec();
-
-    // CD loading skip: fast-forward through loading screens
+    // CD loading skip: check flag from previous frame's geo_exec().
+    // If loading detected, clear vbuf (so the borked pre-load frame doesn't
+    // persist on screen during the skip), then fast-forward without rendering.
     if (cd_mode && cd_skip_loading && geo_cd_sector_decoded_this_frame()) {
-        // Keep running frames while CD sectors are being decoded (max 300 frames)
-        int skip_frames = 0;
-        while (geo_cd_sector_decoded_this_frame() && skip_frames < 300) {
+        memset(vbuf, 0, LSPC_WIDTH * LSPC_SCANLINES * sizeof(uint32_t));
+        video_cb(vbuf + (LSPC_WIDTH * (video_crop_t + 16)) + video_crop_l,
+            video_width_visible, video_height_visible, LSPC_WIDTH << 2);
+        geo_lspc_set_skip_rendering(1);
+        int skip = 0, idle = 0;
+        while (idle < 20) {
             geo_cd_clear_sector_decoded();
             geo_exec();
-            ++skip_frames;
+            ++skip;
+            if (geo_cd_sector_decoded_this_frame())
+                idle = 0;
+            else
+                ++idle;
         }
+        geo_lspc_set_skip_rendering(0);
+        geo_cd_clear_sector_decoded();
+        log_cb(RETRO_LOG_INFO, "[CD SKIP] skipped %d frames\n", skip);
     }
     geo_cd_clear_sector_decoded();
+
+    // Display frame
+    geo_exec();
 
     bool update = false;
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &update) && update) {

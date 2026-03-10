@@ -487,19 +487,16 @@ int geo_cue_read_sector(uint32_t disc_lba, uint8_t *buf) {
     uint64_t byte_offset = t->file_offset +
                            (uint64_t)track_offset * t->sector_size;
 
-    fseek(f->fp, byte_offset, SEEK_SET);
-
     if (t->sector_size == GEO_DISC_SECTOR_SIZE) {
-        // Raw 2352: read full sector, skip 16-byte header for data
-        uint8_t raw[GEO_DISC_SECTOR_SIZE];
-        if (fread(raw, 1, GEO_DISC_SECTOR_SIZE, f->fp) != GEO_DISC_SECTOR_SIZE)
-            return 0;
-        memcpy(buf, raw + 16, GEO_DISC_DATA_SIZE);
+        // Raw 2352: skip 16-byte header, read 2048 data bytes directly
+        fseek(f->fp, byte_offset + 16, SEEK_SET);
     } else {
         // ISO 2048: read directly
-        if (fread(buf, 1, GEO_DISC_DATA_SIZE, f->fp) != GEO_DISC_DATA_SIZE)
-            return 0;
+        fseek(f->fp, byte_offset, SEEK_SET);
     }
+
+    if (fread(buf, 1, GEO_DISC_DATA_SIZE, f->fp) != GEO_DISC_DATA_SIZE)
+        return 0;
 
     return 1;
 }
