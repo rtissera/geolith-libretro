@@ -78,6 +78,13 @@ static const uint16_t hshrink_mask[0x10] = {
     0x5755, 0x575D, 0xD75D, 0xD7DD, 0xF7DD, 0xF7DF, 0xFFDF, 0xFFFF,
 };
 
+// Planar-to-chunky LUT: spread 8 bits into 8 nybble slots of a uint32_t.
+// spread_lut[byte] packs bit N of byte into nybble N (bits N*4..N*4+3).
+// Usage: pixels = spread_lut[b0] | (spread_lut[b1]<<1)
+//               | (spread_lut[b2]<<2) | (spread_lut[b3]<<3)
+// Then pixel N = (pixels >> (N*4)) & 0xF
+static uint32_t spread_lut[256];
+
 // Generate the "Raw" palette LUT
 static void geo_lspc_palgen_raw(void) {
     // 6 bits means 64 iterations, as we include the "dark" bit as the LSB here
@@ -491,6 +498,14 @@ void geo_lspc_init(void) {
 
     geo_lspc_shadow_wr(0);
 
+    // Build planar-to-chunky spread table
+    for (unsigned i = 0; i < 256; ++i) {
+        uint32_t v = 0;
+        for (unsigned b = 0; b < 8; ++b)
+            v |= ((i >> b) & 1) << (b * 4);
+        spread_lut[i] = v;
+    }
+
     romdata = geo_romdata_ptr();
 
     // Default fix line renderer and fix data pointer
@@ -903,32 +918,36 @@ static inline void geo_lspc_sprcalc(void) {
         // Use bitmask instead of per-pixel array lookup
         uint16_t hmask = hshrink_mask[hshrink];
 
-        // Precompute row bytes for both tile halves — each half shares 4
-        // planar bytes across 8 pixels, so load once and shift per pixel.
+        // Batch-decode 8 pixels per tile half via planar-to-chunky LUT.
+        // Each spread_lut[] entry spreads 8 bits into 8 nybble slots;
+        // OR the 4 planes together to get 8 complete 4-bit pixel values.
         const uint8_t *ch = romdata->c;
         unsigned rb0 = thalf0 + (y << 2);
         unsigned rb1 = thalf1 + (y << 2);
-        uint8_t b0[4], b1[4];
+        uint32_t pix0, pix1;
         if (lspc.cd_mode) {
-            b0[0] = ch[rb0+1]; b0[1] = ch[rb0+0]; b0[2] = ch[rb0+3]; b0[3] = ch[rb0+2];
-            b1[0] = ch[rb1+1]; b1[1] = ch[rb1+0]; b1[2] = ch[rb1+3]; b1[3] = ch[rb1+2];
+            pix0 = spread_lut[ch[rb0+1]]       | (spread_lut[ch[rb0+0]] << 1) |
+                   (spread_lut[ch[rb0+3]] << 2) | (spread_lut[ch[rb0+2]] << 3);
+            pix1 = spread_lut[ch[rb1+1]]       | (spread_lut[ch[rb1+0]] << 1) |
+                   (spread_lut[ch[rb1+3]] << 2) | (spread_lut[ch[rb1+2]] << 3);
         } else {
-            b0[0] = ch[rb0+0]; b0[1] = ch[rb0+2]; b0[2] = ch[rb0+1]; b0[3] = ch[rb0+3];
-            b1[0] = ch[rb1+0]; b1[1] = ch[rb1+2]; b1[2] = ch[rb1+1]; b1[3] = ch[rb1+3];
+            pix0 = spread_lut[ch[rb0+0]]       | (spread_lut[ch[rb0+2]] << 1) |
+                   (spread_lut[ch[rb0+1]] << 2) | (spread_lut[ch[rb0+3]] << 3);
+            pix1 = spread_lut[ch[rb1+0]]       | (spread_lut[ch[rb1+2]] << 1) |
+                   (spread_lut[ch[rb1+1]] << 2) | (spread_lut[ch[rb1+3]] << 3);
         }
 
         for (unsigned p = 0; p < 16; ++p) {
             if (hmask & (1 << p)) {
-                const uint8_t *b = (p & 0x08) ? b1 : b0;
                 unsigned x = (p & 0x07) ^ fpix;
-                pentry = ((b[0] >> x) & 1)       | (((b[1] >> x) & 1) << 1) |
-                         (((b[2] >> x) & 1) << 2) | (((b[3] >> x) & 1) << 3);
+                uint32_t pix = (p & 0x08) ? pix1 : pix0;
+                pentry = (pix >> (x << 2)) & 0x0F;
 
                 unsigned xcoord = (xpos + drawpos) & 0x1ff;
                 if (pentry && (xcoord < LSPC_WIDTH))
                     linebuf[lbactive][xcoord] = poffset + pentry;
 
-                ++drawpos; // Increment for coloured and transparent pixels
+                ++drawpos;
             }
         }
     }
