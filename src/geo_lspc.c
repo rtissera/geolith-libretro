@@ -564,20 +564,29 @@ static void geo_lspc_fixline_default(void) {
         unsigned tnum = entry & 0x0fff;
         uint8_t *tdata = &fixdata[tnum << 5];
 
-        // Offset into video buffer to draw the tile row into
-        uint32_t *voffset =
-            vbuf + (LSPC_WIDTH * lspc.scanline) + (x << 3);
-
         // Row in the 8 pixel high tile
         unsigned row = line & 0x07;
 
-        // If the palette entry is non-zero, output a colour
+        // Preload tile row bytes (byte order: 0x10, 0x18, 0x00, 0x08)
+        uint8_t td[4];
+        td[0] = tdata[0x10 + row];
+        td[1] = tdata[0x18 + row];
+        td[2] = tdata[0x00 + row];
+        td[3] = tdata[0x08 + row];
+
+        // Skip fully transparent tile rows
+        if (!(td[0] | td[1] | td[2] | td[3]))
+            continue;
+
+        uint32_t *voffset =
+            vbuf + (LSPC_WIDTH * lspc.scanline) + (x << 3);
+
         uint32_t pentry = 0;
-        for (unsigned p = 0, f = 0x10; p < 4; ++p, f = (f + 0x08) & 0x18) {
-            pentry = tdata[f + row] & 0x0f;
+        for (unsigned p = 0; p < 4; ++p) {
+            pentry = td[p] & 0x0f;
             if (pentry) voffset[p << 1] = palette[poffset + pentry];
 
-            pentry = (tdata[f + row] >> 4) & 0x0f;
+            pentry = td[p] >> 4;
             if (pentry) voffset[(p << 1) + 1] = palette[poffset + pentry];
         }
     }
@@ -621,15 +630,25 @@ static void geo_lspc_fixline_line(void) {
         unsigned poffset = ((entry >> 8) & 0xf0) + (lspc.palbank * SIZE_4K);
         unsigned tnum = (entry & 0x0fff) + offsets[(trow - 2) & 0x1f];
         uint8_t *tdata = &fixdata[tnum << 5];
+        unsigned row = line & 0x07;
+
+        uint8_t td[4];
+        td[0] = tdata[0x10 + row];
+        td[1] = tdata[0x18 + row];
+        td[2] = tdata[0x00 + row];
+        td[3] = tdata[0x08 + row];
+
+        if (!(td[0] | td[1] | td[2] | td[3]))
+            continue;
+
         uint32_t *voffset =
             vbuf + (LSPC_WIDTH * lspc.scanline) + (x << 3);
-        unsigned row = line & 0x07;
         uint32_t pentry = 0;
-        for (unsigned p = 0, f = 0x10; p < 4; ++p, f = (f + 0x08) & 0x18) {
-            pentry = tdata[f + row] & 0x0f;
+        for (unsigned p = 0; p < 4; ++p) {
+            pentry = td[p] & 0x0f;
             if (pentry) voffset[p << 1] = palette[poffset + pentry];
 
-            pentry = (tdata[f + row] >> 4) & 0x0f;
+            pentry = td[p] >> 4;
             if (pentry) voffset[(p << 1) + 1] = palette[poffset + pentry];
         }
     }
@@ -654,21 +673,25 @@ static void geo_lspc_fixline_tile(void) {
             (5 - (x % 6)) * 2) & 0x03;
         unsigned tnum = (entry & 0x0fff) + (offset * SIZE_4K);
         uint8_t *tdata = &fixdata[tnum << 5];
-
-        // Offset into video buffer to draw the tile row into
-        uint32_t *voffset =
-            vbuf + (LSPC_WIDTH * lspc.scanline) + (x << 3);
-
-        // Row in the 8 pixel high tile
         unsigned row = line & 0x07;
 
-        // If the palette entry is non-zero, output a colour
+        uint8_t td[4];
+        td[0] = tdata[0x10 + row];
+        td[1] = tdata[0x18 + row];
+        td[2] = tdata[0x00 + row];
+        td[3] = tdata[0x08 + row];
+
+        if (!(td[0] | td[1] | td[2] | td[3]))
+            continue;
+
+        uint32_t *voffset =
+            vbuf + (LSPC_WIDTH * lspc.scanline) + (x << 3);
         uint32_t pentry = 0;
-        for (unsigned p = 0, f = 0x10; p < 4; ++p, f = (f + 0x08) & 0x18) {
-            pentry = tdata[f + row] & 0x0f;
+        for (unsigned p = 0; p < 4; ++p) {
+            pentry = td[p] & 0x0f;
             if (pentry) voffset[p << 1] = palette[poffset + pentry];
 
-            pentry = (tdata[f + row] >> 4) & 0x0f;
+            pentry = td[p] >> 4;
             if (pentry) voffset[(p << 1) + 1] = palette[poffset + pentry];
         }
     }
@@ -936,6 +959,10 @@ static inline void geo_lspc_sprcalc(void) {
             pix1 = spread_lut[ch[rb1+0]]       | (spread_lut[ch[rb1+2]] << 1) |
                    (spread_lut[ch[rb1+1]] << 2) | (spread_lut[ch[rb1+3]] << 3);
         }
+
+        // Skip fully transparent tile rows
+        if ((pix0 | pix1) == 0)
+            continue;
 
         for (unsigned p = 0; p < 16; ++p) {
             if (hmask & (1 << p)) {
