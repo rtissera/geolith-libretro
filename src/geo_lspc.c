@@ -31,6 +31,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "geo.h"
 #include "geo_cd.h"
@@ -43,6 +44,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 static void geo_lspc_fixline_default(void);
 static void (*geo_lspc_fixline)(void);
 
+static inline unsigned geo_lspc_tpix_cart(unsigned tbase, unsigned x, unsigned y);
+static inline unsigned geo_lspc_tpix_cd(unsigned tbase, unsigned x, unsigned y);
+
 static lspc_t lspc;
 static romdata_t *romdata = NULL;
 
@@ -50,13 +54,14 @@ static uint32_t *vbuf = NULL;
 
 static unsigned sprlimit = 96; // Sprites-per-line limit
 
-static unsigned linebuf[2][LSPC_WIDTH]; // Line buffers for sprite pixels
+static uint16_t linebuf[2][LSPC_WIDTH]; // Line buffers for sprite pixels
 static unsigned lbactive = 0; // Active line buffer
 
 static uint8_t *fixdata = NULL;
 
 static unsigned fixbanksw = 0;
 static uint32_t crommask = 0;
+static uint32_t crombmask = 0; // Byte-level mask for C ROM (next pow2 - 1)
 
 // Dynamic output palette with values converted from palette RAM
 static uint32_t palette_normal[SIZE_8K];
@@ -67,24 +72,10 @@ static uint32_t *palette = palette_normal;
 static unsigned lut_normal[64];
 static unsigned lut_shadow[64];
 
-// Horizontal Shrink LUT -- from neogeodev
-static unsigned lut_hshrink[0x10][0x10] = {
-    { 0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0 }, // (15 pixel skipped, 1 remaining)
-    { 0,0,0,0,1,0,0,0,1,0,0,0,0,0,0,0 }, // (14 pixels skipped...)
-    { 0,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0 },
-    { 0,0,1,0,1,0,0,0,1,0,0,0,1,0,0,0 },
-    { 0,0,1,0,1,0,0,0,1,0,0,0,1,0,1,0 },
-    { 0,0,1,0,1,0,1,0,1,0,0,0,1,0,1,0 },
-    { 0,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0 },
-    { 1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0 },
-    { 1,0,1,0,1,0,1,0,1,1,1,0,1,0,1,0 },
-    { 1,0,1,1,1,0,1,0,1,1,1,0,1,0,1,0 },
-    { 1,0,1,1,1,0,1,0,1,1,1,0,1,0,1,1 },
-    { 1,0,1,1,1,0,1,1,1,1,1,0,1,0,1,1 },
-    { 1,0,1,1,1,0,1,1,1,1,1,0,1,1,1,1 },
-    { 1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1 },
-    { 1,1,1,1,1,0,1,1,1,1,1,1,1,1,1,1 }, // (...1 pixel skipped)
-    { 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1 }, // (no pixels skipped, full size)
+// Horizontal Shrink LUT -- from neogeodev (bitmask: bit N = pixel N visible)
+static const uint16_t hshrink_mask[0x10] = {
+    0x0100, 0x0110, 0x1110, 0x1114, 0x5114, 0x5154, 0x5554, 0x5555,
+    0x5755, 0x575D, 0xD75D, 0xD7DD, 0xF7DD, 0xF7DF, 0xFFDF, 0xFFFF,
 };
 
 // Generate the "Raw" palette LUT
@@ -338,6 +329,10 @@ void geo_lspc_set_skip_rendering(int skip) {
 // Perform post-load operations for C ROM
 void geo_lspc_postload(void) {
     crommask = geo_calc_mask(32, romdata->csz >> 7);
+    // Byte-level mask: round csz up to next power of 2, subtract 1
+    uint32_t p2 = 1;
+    while (p2 < romdata->csz) p2 <<= 1;
+    crombmask = p2 - 1;
 }
 
 /* VRAM Memory Map
@@ -373,12 +368,12 @@ static inline uint32_t geo_lspc_backdrop(void) {
 static inline void geo_lspc_bdsprline(void) {
     uint32_t bdcol = geo_lspc_backdrop();
     uint32_t *ptr = vbuf + (lspc.scanline * LSPC_WIDTH);
-    unsigned *lb = linebuf[lbactive];
+    uint16_t *lb = linebuf[lbactive];
 
-    for (unsigned p = 0; p < LSPC_WIDTH; ++p) {
+    for (unsigned p = 0; p < LSPC_WIDTH; ++p)
         ptr[p] = lb[p] ? palette[lb[p]] : bdcol;
-        lb[p] = 0;
-    }
+
+    memset(lb, 0, LSPC_WIDTH * sizeof(uint16_t));
 }
 
 // Read half of a a palette RAM entry from the active bank
@@ -697,47 +692,43 @@ void geo_lspc_set_fix_banksw(unsigned f) {
     }
 }
 
-static inline unsigned geo_lspc_tpix(unsigned tbase, unsigned x, unsigned y) {
-    /* Sprite Tile Decoding
-       Tiles are 8x8 with palette index values represented in a planar format,
-       which spans 4 bytes per horizontal line. Each bit in a byte represents
-       one component of a 4-bit palette entry:
-       =================================
-       | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0 | Take the tile's base address in C ROM
-       ================================= and shift right by the X offset in the
-    v0 | 1 | 1 | 0 | 1 | 0 | 0 | 0 | 1 | tile to isolate the correct bit. Do
-    v1 | 0 | 1 | 0 | 0 | 0 | 1 | 0 | 1 | this for 4 consecutive bytes, then
-    v2 | 1 | 0 | 1 | 1 | 0 | 0 | 1 | 1 | shift and OR the bits together to
-    v3 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | create a 4-bit palette entry.
-       ---------------------------------
+/* Sprite Tile Decoding
+   Tiles are 8x8 with palette index values represented in a planar format,
+   which spans 4 bytes per horizontal line. Each bit in a byte represents
+   one component of a 4-bit palette entry:
+   =================================
+   | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0 | Take the tile's base address in C ROM
+   ================================= and shift right by the X offset in the
+v0 | 1 | 1 | 0 | 1 | 0 | 0 | 0 | 1 | tile to isolate the correct bit. Do
+v1 | 0 | 1 | 0 | 0 | 0 | 1 | 0 | 1 | this for 4 consecutive bytes, then
+v2 | 1 | 0 | 1 | 1 | 0 | 0 | 1 | 1 | shift and OR the bits together to
+v3 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | create a 4-bit palette entry.
+   ---------------------------------
 
-       Bytes 0 and 1 come from odd numbered C ROMs, while bytes 2 and 3 come
-       from even numbered C ROMs. Because the data from the C ROM pairs are
-       interleaved every byte, the second byte is in the third position, and
-       the third byte is in the second position.
+   Bytes 0 and 1 come from odd numbered C ROMs, while bytes 2 and 3 come
+   from even numbered C ROMs. Because the data from the C ROM pairs are
+   interleaved every byte, the second byte is in the third position, and
+   the third byte is in the second position.
 
-       Notes: Since there are 4 bytes per row of pixels, multiply the tile's
-              base address by 4 to select the specific row in the tile.
-              The pixel data is stored right to left -- this means it is in
-              reverse order from how it is displayed unless horizontal flip
-              is enabled for the tile.
-    */
-    unsigned base = tbase + (y << 2);
-    unsigned v0, v1, v2, v3;
-    if (lspc.cd_mode) {
-        // CD SPR DRAM: non-interleaved byte order [1, 0, 3, 2]
-        v0 = (romdata->c[base + 1]) >> (x);
-        v1 = (romdata->c[base + 0]) >> (x);
-        v2 = (romdata->c[base + 3]) >> (x);
-        v3 = (romdata->c[base + 2]) >> (x);
-    } else {
-        // Cart C ROM: interleaved odd/even byte order [0, 2, 1, 3]
-        v0 = (romdata->c[base + 0]) >> (x);
-        v1 = (romdata->c[base + 2]) >> (x);
-        v2 = (romdata->c[base + 1]) >> (x);
-        v3 = (romdata->c[base + 3]) >> (x);
-    }
-    return (v0 & 0x01) | (v1 & 0x01) << 1 | (v2 & 0x01) << 2 | (v3 & 0x01) << 3;
+   Notes: Since there are 4 bytes per row of pixels, multiply the tile's
+          base address by 4 to select the specific row in the tile.
+          The pixel data is stored right to left -- this means it is in
+          reverse order from how it is displayed unless horizontal flip
+          is enabled for the tile.
+*/
+
+// Cart C ROM: interleaved odd/even byte order [0, 2, 1, 3]
+static inline unsigned geo_lspc_tpix_cart(unsigned tbase, unsigned x, unsigned y) {
+    const uint8_t *base = romdata->c + tbase + (y << 2);
+    return ((base[0] >> x) & 1)       | (((base[2] >> x) & 1) << 1) |
+           (((base[1] >> x) & 1) << 2) | (((base[3] >> x) & 1) << 3);
+}
+
+// CD SPR DRAM: non-interleaved byte order [1, 0, 3, 2]
+static inline unsigned geo_lspc_tpix_cd(unsigned tbase, unsigned x, unsigned y) {
+    const uint8_t *base = romdata->c + tbase + (y << 2);
+    return ((base[1] >> x) & 1)       | (((base[0] >> x) & 1) << 1) |
+           (((base[3] >> x) & 1) << 2) | (((base[2] >> x) & 1) << 3);
 }
 
 // Calculate a line of sprite data 2 lines in advance
@@ -886,7 +877,7 @@ static inline void geo_lspc_sprcalc(void) {
            Multiply the tile number by 128 to get the offset of the tile in
            C ROM.
         */
-        unsigned toffset = (tnum << 7) % romdata->csz;
+        unsigned toffset = (tnum << 7) & crombmask;
 
         // Y value in the sprite tile to be drawn, flipped if necessary
         unsigned y = vflip ? (0x0f - (srow & 0x0f)) : (srow & 0x0f);
@@ -902,18 +893,38 @@ static inline void geo_lspc_sprcalc(void) {
         unsigned ftile = hflip ? 0x00 : 0x08; // Reverse tile address
         unsigned fpix = hflip ? 0x07 : 0x00; // Reverse pixel drawing order
 
+        // Precompute tile base for both halves (p<8 and p>=8)
+        unsigned thalf0 = toffset + ((0 ^ ftile) << 3);
+        unsigned thalf1 = toffset + ((0x08 ^ ftile) << 3);
+
         // Draw position must be separate from loop iterator due to hshrink
         unsigned drawpos = 0;
 
-        // X coordinates in the line buffer
-        unsigned xcoord = 0;
+        // Use bitmask instead of per-pixel array lookup
+        uint16_t hmask = hshrink_mask[hshrink];
+
+        // Precompute row bytes for both tile halves — each half shares 4
+        // planar bytes across 8 pixels, so load once and shift per pixel.
+        const uint8_t *ch = romdata->c;
+        unsigned rb0 = thalf0 + (y << 2);
+        unsigned rb1 = thalf1 + (y << 2);
+        uint8_t b0[4], b1[4];
+        if (lspc.cd_mode) {
+            b0[0] = ch[rb0+1]; b0[1] = ch[rb0+0]; b0[2] = ch[rb0+3]; b0[3] = ch[rb0+2];
+            b1[0] = ch[rb1+1]; b1[1] = ch[rb1+0]; b1[2] = ch[rb1+3]; b1[3] = ch[rb1+2];
+        } else {
+            b0[0] = ch[rb0+0]; b0[1] = ch[rb0+2]; b0[2] = ch[rb0+1]; b0[3] = ch[rb0+3];
+            b1[0] = ch[rb1+0]; b1[1] = ch[rb1+2]; b1[2] = ch[rb1+1]; b1[3] = ch[rb1+3];
+        }
 
         for (unsigned p = 0; p < 16; ++p) {
-            if (lut_hshrink[hshrink][p]) {
-                pentry = geo_lspc_tpix(toffset + (((0x08 & p) ^ ftile) << 3),
-                    (p & 0x07) ^ fpix, y);
+            if (hmask & (1 << p)) {
+                const uint8_t *b = (p & 0x08) ? b1 : b0;
+                unsigned x = (p & 0x07) ^ fpix;
+                pentry = ((b[0] >> x) & 1)       | (((b[1] >> x) & 1) << 1) |
+                         (((b[2] >> x) & 1) << 2) | (((b[3] >> x) & 1) << 3);
 
-                xcoord = (xpos + drawpos) & 0x1ff;
+                unsigned xcoord = (xpos + drawpos) & 0x1ff;
                 if (pentry && (xcoord < LSPC_WIDTH))
                     linebuf[lbactive][xcoord] = poffset + pentry;
 
@@ -1002,13 +1013,15 @@ void geo_lspc_run(unsigned cycs) {
         }
 
         if ((start <= 712) && (end > 712)) { // This is an educated guess
-            lspc.scanline = (lspc.scanline + 1) % LSPC_SCANLINES;
+            if (++lspc.scanline >= LSPC_SCANLINES)
+                lspc.scanline = 0;
         }
 
         lspc.cyc = end;
         cycs -= runcycs;
 
-        lspc.cyc %= M68K_CYC_PER_LINE;
+        if (lspc.cyc >= M68K_CYC_PER_LINE)
+            lspc.cyc -= M68K_CYC_PER_LINE;
     }
 }
 
