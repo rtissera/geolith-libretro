@@ -90,7 +90,9 @@ unsigned    m68ki_aerr_address;
 unsigned    m68ki_aerr_write_mode;
 unsigned    m68ki_aerr_fc;
 
+#if M68K_EMULATE_BUS_ERROR
 jmp_buf m68ki_bus_error_jmp_buf;
+#endif
 
 /* Used by shift & rotate instructions */
 const uint8_t m68ki_shift_8_table[65] =
@@ -1090,11 +1092,13 @@ void m68k_init(void)
 	m68k_set_instr_hook_callback(NULL);
 }
 
+#if M68K_EMULATE_BUS_ERROR
 /* Trigger a Bus Error exception */
 void m68k_pulse_bus_error(void)
 {
 	m68ki_exception_bus_error();
 }
+#endif
 
 /* Pulse the RESET line on the CPU */
 void m68k_pulse_reset(void)

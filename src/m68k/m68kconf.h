@@ -176,6 +176,12 @@ int geo_m68k_int_ack(int level);
  */
 #define M68K_EMULATE_ADDRESS_ERROR  OPT_OFF
 
+/* If ON, the CPU will use setjmp/longjmp for bus error trapping.
+ * Turn OFF if the host system never calls m68k_pulse_bus_error() to
+ * eliminate per-execute setjmp overhead.
+ */
+#define M68K_EMULATE_BUS_ERROR      OPT_OFF
+
 
 /* Turn ON to enable logging of illegal instruction calls.
  * M68K_LOG_FILEHANDLE must be #defined to a stdio file stream.

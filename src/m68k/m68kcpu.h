@@ -1844,6 +1844,7 @@ static inline void m68ki_exception_privilege_violation(void)
 	USE_CYCLES(CYC_EXCEPTION[EXCEPTION_PRIVILEGE_VIOLATION] - CYC_INSTRUCTION[REG_IR]);
 }
 
+#if M68K_EMULATE_BUS_ERROR
 extern jmp_buf m68ki_bus_error_jmp_buf;
 
 #define m68ki_check_bus_error_trap() setjmp(m68ki_bus_error_jmp_buf)
@@ -1878,6 +1879,9 @@ m68k_read_memory_8(0x00ffff01);
 	m68ki_jump_vector(EXCEPTION_BUS_ERROR);
 	longjmp(m68ki_bus_error_jmp_buf, 1);
 }
+#else
+	#define m68ki_check_bus_error_trap()
+#endif /* M68K_EMULATE_BUS_ERROR */
 
 extern int cpu_log_enabled;
 
