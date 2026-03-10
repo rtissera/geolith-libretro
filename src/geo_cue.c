@@ -435,7 +435,7 @@ int geo_cue_open(const char *path) {
 
     // Log
     for (unsigned i = 0; i < num_tracks; ++i) {
-        geo_log(GEO_LOG_DBG, "CUE Track %u: type=%s start=%u frames=%u "
+        geo_log(GEO_LOG_INF, "CUE Track %u: type=%s start=%u frames=%u "
             "pregap=%u file=%d offset=%u\n",
             i + 1,
             tracks[i].type == GEO_DISC_TRACK_AUDIO ? "AUDIO" : "DATA",

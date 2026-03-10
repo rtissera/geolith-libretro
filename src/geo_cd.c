@@ -573,11 +573,6 @@ static void cd_comm_process_command(void) {
 
     uint8_t m, s, f;
 
-    if (cd.cmd[0] != 0x00) {
-        geo_log(GEO_LOG_DBG, "CD CMD: %02x %02x %02x %02x %02x\n",
-            cd.cmd[0], cd.cmd[1], cd.cmd[2], cd.cmd[3], cd.cmd[4]);
-    }
-
     switch (cd.cmd[0]) {
         case 0x00: // Status
             cd.status[0] = (cd.status[0] & 0x0f) | cd.drive_status;
@@ -680,7 +675,6 @@ static void cd_comm_process_command(void) {
                     cd.status[2] = 0;
                     cd.status[3] = 0;
                     cd.status[4] = 0;
-                    geo_log(GEO_LOG_DBG, "Protection check done\n");
                     break;
                 default:
                     cd.status[0] = cd.drive_status;
@@ -716,9 +710,6 @@ static void cd_comm_process_command(void) {
                 cdda_playing = 0;
             }
 
-            geo_log(GEO_LOG_DBG, "Play: lba=%u data=%d audio=%d PC=%06x\n",
-                cd.play_lba, cd.playing_data, cd.playing_audio,
-                m68k_get_reg(NULL, M68K_REG_PPC));
             cd.drive_status = CD_STATUS_PLAY;
             cd.status[0] = cd.drive_status | 0x02;
             cd.status[1] = to_bcd(track);
@@ -814,7 +805,7 @@ static void cd_comm_process_command(void) {
             break;
 
         default:
-            geo_log(GEO_LOG_DBG, "Unknown CD command: %02x\n", cd.cmd[0]);
+            geo_log(GEO_LOG_WRN, "Unknown CD command: %02x\n", cd.cmd[0]);
             cd.status[0] = cd.drive_status;
             cd.status[1] = 0;
             cd.status[2] = 0;
@@ -990,10 +981,8 @@ static void cd_dma_execute(void) {
                     if (read16(pram, (src + i * 2) & (SIZE_2M - 1)))
                         blank = 0;
                 }
-                if (blank) {
-                    geo_log(GEO_LOG_DBG, "DMA: inhibit blank vector table write\n");
+                if (blank)
                     break;
-                }
             }
 
             for (uint32_t i = 0; i < dma.len; ++i) {
@@ -1102,8 +1091,6 @@ static uint8_t cd_reg_read_8(uint32_t addr) {
             return 0x00;
     }
 
-    geo_log(GEO_LOG_DBG, "CD reg read 8: FF%04x @ PC=%06x\n",
-        addr, m68k_get_reg(NULL, M68K_REG_PPC));
     return 0x00;
 }
 
@@ -1171,10 +1158,6 @@ static void cd_reg_write_8(uint32_t addr, uint8_t val) {
 
         case 0x0061: // DMA control
             if (val == 0x40) {
-                uint8_t handler = pram[0x10FE0F]; // 7E0F(a5) where a5=0x108000
-                geo_log(GEO_LOG_DBG, "DMA: dst=%06x len=%04x cfg=%04x src=%06x h=%u dac=%04x dbc=%04x\n",
-                    dma.dst, dma.len, dma.config, dma.src, handler,
-                    lc.dacl, lc.dbc);
                 dma.enabled = 1;
                 cd_dma_execute();
             } else if (val == 0x00) {
@@ -1281,8 +1264,6 @@ static void cd_reg_write_8(uint32_t addr, uint8_t val) {
             return;
     }
 
-    geo_log(GEO_LOG_DBG, "CD reg write 8: FF%04x = %02x @ PC=%06x\n",
-        addr, val, m68k_get_reg(NULL, M68K_REG_PPC));
 }
 
 static void cd_reg_write_16(uint32_t addr, uint16_t val) {
@@ -1587,7 +1568,6 @@ void geo_cd_m68k_write_8(unsigned address, unsigned value) {
 
             case 0x3a0001: geo_lspc_shadow_wr(0); return;
             case 0x3a0003:
-                if (vectable != 0) geo_log(GEO_LOG_DBG, "VECTABLE: -> BIOS (PC=%06x)\n", m68k_get_reg(NULL, M68K_REG_PPC));
                 vectable = 0; return; // REG_SWPBIOS
             case 0x3a0005: return; // REG_CRDUNLOCK1
             case 0x3a0007: return; // REG_CRDLOCK2
@@ -1599,7 +1579,6 @@ void geo_cd_m68k_write_8(unsigned address, unsigned value) {
             case 0x3a000f: geo_lspc_palram_bank(1); return;
             case 0x3a0011: geo_lspc_shadow_wr(1); return;
             case 0x3a0013:
-                if (vectable != 1) geo_log(GEO_LOG_DBG, "VECTABLE: -> PRAM (PC=%06x)\n", m68k_get_reg(NULL, M68K_REG_PPC));
                 vectable = 1; return; // REG_SWPROM (to PRAM)
             case 0x3a0015: return; // REG_CRDLOCK1
             case 0x3a0017: return; // REG_CRDUNLOCK2
