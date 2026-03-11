@@ -682,18 +682,19 @@ void geo_exec(void) {
             ++ngsys.irq2_dec;
         }
 
-        for (uint32_t i = 0; i < ngsys.irq2_dec; ++i) {
-            if (--ngsys.irq2_counter == 0) {
-                /* Reload counter when it reaches 0 - if this bit is not set,
-                   rely on unsigned integer underflow to prevent repeated
-                   assertion of the IRQ line.
-                */
-                if (ngsys.irq2_ctrl & IRQ_TIMER_RELOAD_COUNT0)
-                    ngsys.irq2_counter += ngsys.irq2_reload;
+        if (ngsys.irq2_counter > ngsys.irq2_dec) {
+            // Fast path: counter won't reach zero, batch subtract
+            ngsys.irq2_counter -= ngsys.irq2_dec;
+        } else {
+            // Slow path: counter near zero, iterate for precise reload/IRQ
+            for (uint32_t i = 0; i < ngsys.irq2_dec; ++i) {
+                if (--ngsys.irq2_counter == 0) {
+                    if (ngsys.irq2_ctrl & IRQ_TIMER_RELOAD_COUNT0)
+                        ngsys.irq2_counter += ngsys.irq2_reload;
 
-                // Timer Interrupt Enabled
-                if (ngsys.irq2_ctrl & IRQ_TIMER_ENABLED)
-                    geo_m68k_interrupt(irq_timer_level);
+                    if (ngsys.irq2_ctrl & IRQ_TIMER_ENABLED)
+                        geo_m68k_interrupt(irq_timer_level);
+                }
             }
         }
 

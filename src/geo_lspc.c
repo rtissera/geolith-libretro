@@ -964,17 +964,34 @@ static inline void geo_lspc_sprcalc(void) {
         if ((pix0 | pix1) == 0)
             continue;
 
-        for (unsigned p = 0; p < 16; ++p) {
-            if (hmask & (1 << p)) {
-                unsigned x = (p & 0x07) ^ fpix;
-                uint32_t pix = (p & 0x08) ? pix1 : pix0;
-                pentry = (pix >> (x << 2)) & 0x0F;
+        // Fast path: no horizontal shrink and fully on-screen
+        unsigned startx = (xpos + drawpos) & 0x1ff;
+        if (hmask == 0xFFFF && startx <= (LSPC_WIDTH - 16)) {
+            uint16_t *dst = linebuf[lbactive] + startx;
+            for (unsigned p = 0; p < 8; ++p) {
+                unsigned x = p ^ fpix;
+                uint32_t pe = (pix0 >> (x << 2)) & 0xF;
+                if (pe) dst[p] = poffset + pe;
+            }
+            for (unsigned p = 0; p < 8; ++p) {
+                unsigned x = p ^ fpix;
+                uint32_t pe = (pix1 >> (x << 2)) & 0xF;
+                if (pe) dst[8 + p] = poffset + pe;
+            }
+            drawpos += 16;
+        } else {
+            for (unsigned p = 0; p < 16; ++p) {
+                if (hmask & (1 << p)) {
+                    unsigned x = (p & 0x07) ^ fpix;
+                    uint32_t pix = (p & 0x08) ? pix1 : pix0;
+                    pentry = (pix >> (x << 2)) & 0x0F;
 
-                unsigned xcoord = (xpos + drawpos) & 0x1ff;
-                if (pentry && (xcoord < LSPC_WIDTH))
-                    linebuf[lbactive][xcoord] = poffset + pentry;
+                    unsigned xcoord = (xpos + drawpos) & 0x1ff;
+                    if (pentry && (xcoord < LSPC_WIDTH))
+                        linebuf[lbactive][xcoord] = poffset + pentry;
 
-                ++drawpos;
+                    ++drawpos;
+                }
             }
         }
     }
